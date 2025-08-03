@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-電子公図データ抽出Webアプリ (Streamlit版) - Web/GitHub参照対応 - 丁目・小字選択機能付き
+電子公図データ抽出Webアプリ (Streamlit版) - Web/GitHub参照対応 - 丁目・小字選択機能付き - Webフォルダ対応
 """
 
 import streamlit as st
@@ -14,7 +14,10 @@ import io
 import tempfile
 import os
 import requests
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin, urlunparse
+import re
+from bs4 import BeautifulSoup
+import json
 
 # ページ設定
 st.set_page_config(
@@ -27,6 +30,140 @@ class KojiWebExtractor:
     def __init__(self):
         if 'gdf' not in st.session_state:
             st.session_state.gdf = None
+        if 'web_files_cache' not in st.session_state:
+            st.session_state.web_files_cache = {}
+    
+    def get_files_from_web_folder(self, folder_url, file_extensions=None):
+        """Web上のフォルダからファイル一覧を取得"""
+        if file_extensions is None:
+            file_extensions = ['.zip', '.shp']
+        
+        try:
+            # キャッシュをチェック
+            cache_key = f"{folder_url}_{','.join(file_extensions)}"
+            if cache_key in st.session_state.web_files_cache:
+                return st.session_state.web_files_cache[cache_key]
+            
+            # GitHubのフォルダの場合
+            if 'github.com' in folder_url:
+                return self._get_github_folder_files(folder_url, file_extensions)
+            
+            # 通常のWebフォルダの場合
+            return self._get_generic_web_folder_files(folder_url, file_extensions)
+            
+        except Exception as e:
+            st.error(f"フォルダからのファイル取得に失敗しました: {str(e)}")
+            return []
+    
+    def _get_github_folder_files(self, folder_url, file_extensions):
+        """GitHubフォルダからファイル一覧を取得（GitHub API使用）"""
+        try:
+            # GitHub URLを解析
+            # https://github.com/user/repo/tree/branch/path -> GitHub API URL
+            parts = folder_url.replace('https://github.com/', '').split('/')
+            if len(parts) < 2:
+                raise Exception("無効なGitHub URLです")
+            
+            user = parts[0]
+            repo = parts[1]
+            
+            # ブランチとパスを特定
+            if len(parts) > 3 and parts[2] == 'tree':
+                branch = parts[3]
+                path = '/'.join(parts[4:]) if len(parts) > 4 else ''
+            else:
+                branch = 'main'
+                path = '/'.join(parts[2:]) if len(parts) > 2 else ''
+            
+            # GitHub API URL構築
+            api_url = f"https://api.github.com/repos/{user}/{repo}/contents/{path}"
+            if branch != 'main':
+                api_url += f"?ref={branch}"
+            
+            response = requests.get(api_url, timeout=30)
+            response.raise_for_status()
+            
+            files_data = response.json()
+            files = []
+            
+            for item in files_data:
+                if item['type'] == 'file':
+                    file_name = item['name']
+                    if any(file_name.lower().endswith(ext.lower()) for ext in file_extensions):
+                        # rawファイルURLを生成
+                        raw_url = item['download_url']
+                        files.append({
+                            'name': file_name,
+                            'url': raw_url,
+                            'size': item.get('size', 0),
+                            'description': f"GitHubファイル ({item.get('size', 0)} bytes)"
+                        })
+            
+            # キャッシュに保存
+            cache_key = f"{folder_url}_{','.join(file_extensions)}"
+            st.session_state.web_files_cache[cache_key] = files
+            
+            return files
+            
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"GitHub APIアクセスエラー: {str(e)}")
+        except json.JSONDecodeError:
+            raise Exception("GitHub APIレスポンスの解析に失敗しました")
+        except Exception as e:
+            raise Exception(f"GitHubフォルダ処理エラー: {str(e)}")
+    
+    def _get_generic_web_folder_files(self, folder_url, file_extensions):
+        """一般的なWebフォルダからファイル一覧を取得（HTMLパース）"""
+        try:
+            response = requests.get(folder_url, timeout=30)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            files = []
+            
+            # リンクを検索
+            links = soup.find_all('a', href=True)
+            
+            for link in links:
+                href = link['href']
+                link_text = link.get_text().strip()
+                
+                # 相対URLを絶対URLに変換
+                if not href.startswith(('http://', 'https://')):
+                    href = urljoin(folder_url, href)
+                
+                # ファイル拡張子をチェック
+                if any(href.lower().endswith(ext.lower()) for ext in file_extensions):
+                    # ファイル名を取得
+                    file_name = os.path.basename(urlparse(href).path)
+                    if not file_name:
+                        file_name = link_text
+                    
+                    files.append({
+                        'name': file_name,
+                        'url': href,
+                        'size': None,
+                        'description': f"Webファイル"
+                    })
+            
+            # 重複除去
+            seen_urls = set()
+            unique_files = []
+            for file_info in files:
+                if file_info['url'] not in seen_urls:
+                    seen_urls.add(file_info['url'])
+                    unique_files.append(file_info)
+            
+            # キャッシュに保存
+            cache_key = f"{folder_url}_{','.join(file_extensions)}"
+            st.session_state.web_files_cache[cache_key] = unique_files
+            
+            return unique_files
+            
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Webフォルダアクセスエラー: {str(e)}")
+        except Exception as e:
+            raise Exception(f"Webフォルダ処理エラー: {str(e)}")
     
     def download_file_from_url(self, url):
         """URLからファイルをダウンロード"""
@@ -321,7 +458,7 @@ class KojiWebExtractor:
             return df_summary, overlay_gdf, f"対象筆: {len(df_summary)}件, 周辺筆: {len(overlay_gdf)}件"
             
         except Exception as e:
-            return None, None, f"エラー: {str(e)}"
+            return None, None, f"エラー: {str(e)}")
 
 def get_chome_options(gdf, selected_oaza):
     """指定された大字名に対応する丁目の選択肢を取得"""
@@ -389,6 +526,106 @@ def main():
     # サイドバー
     st.sidebar.header("📋 プリセットファイル")
     
+    # Webフォルダからのプリセット選択
+    st.sidebar.subheader("🌐 Webフォルダからのプリセット")
+    
+    # デフォルトのWebフォルダURL（例）
+    default_folder_urls = [
+        "https://github.com/example/geodata/tree/main/shapefiles",
+        "https://data.example.com/shapefiles/",
+        "https://github.com/your-org/survey-data/tree/main/data"
+    ]
+    
+    # カスタムフォルダURL入力
+    custom_folder_url = st.sidebar.text_input(
+        "カスタムフォルダURL",
+        placeholder="https://github.com/user/repo/tree/main/data",
+        help="Shapefileが格納されているWebフォルダのURLを入力してください"
+    )
+    
+    # フォルダURL選択
+    folder_options = ["カスタム"] + [f"サンプル{i+1}" for i in range(len(default_folder_urls))]
+    selected_folder_option = st.sidebar.selectbox(
+        "フォルダを選択",
+        folder_options,
+        help="プリセットフォルダまたはカスタムURLを選択"
+    )
+    
+    # 選択されたフォルダURLを決定
+    if selected_folder_option == "カスタム":
+        folder_url = custom_folder_url
+    else:
+        folder_index = int(selected_folder_option.replace("サンプル", "")) - 1
+        folder_url = default_folder_urls[folder_index]
+    
+    # ファイル一覧を取得
+    web_files = []
+    if folder_url:
+        if st.sidebar.button("📂 フォルダからファイル一覧を取得", type="secondary"):
+            with st.spinner("Webフォルダからファイル一覧を取得中..."):
+                web_files = extractor.get_files_from_web_folder(folder_url)
+            
+            if web_files:
+                st.sidebar.success(f"✅ {len(web_files)}個のファイルが見つかりました")
+                st.session_state.current_web_files = web_files
+                st.session_state.current_folder_url = folder_url
+            else:
+                st.sidebar.warning("❌ 対応ファイルが見つかりませんでした")
+    
+    # キャッシュされたファイル一覧を使用
+    if 'current_web_files' in st.session_state:
+        web_files = st.session_state.current_web_files
+        
+        if web_files:
+            st.sidebar.write(f"**📁 {st.session_state.current_folder_url}**")
+            st.sidebar.write(f"利用可能ファイル: {len(web_files)}個")
+            
+            # ファイル選択
+            file_options = ["選択なし"] + [f["name"] for f in web_files]
+            selected_file = st.sidebar.selectbox(
+                "ファイルを選択",
+                file_options,
+                help="読み込むShapefileを選択してください"
+            )
+            
+            if selected_file != "選択なし":
+                # 選択されたファイルの詳細を表示
+                selected_file_info = next((f for f in web_files if f["name"] == selected_file), None)
+                if selected_file_info:
+                    st.sidebar.info(f"**{selected_file_info['name']}**\n\n{selected_file_info['description']}")
+                    
+                    if st.sidebar.button("📥 選択ファイルを読み込み", type="primary"):
+                        try:
+                            with st.spinner(f"ファイル「{selected_file}」を読み込み中..."):
+                                st.session_state.gdf = extractor.load_shapefile_from_url(selected_file_info['url'])
+                            
+                            st.sidebar.success("✅ ファイル読み込み完了!")
+                            st.sidebar.info(f"📊 レコード数: {len(st.session_state.gdf):,}件")
+                            
+                            if st.session_state.gdf.crs:
+                                st.sidebar.info(f"🗺️ 座標系: {st.session_state.gdf.crs}")
+                            
+                            # 丁目名・小字名列の存在確認
+                            if '丁目名' in st.session_state.gdf.columns:
+                                chome_count = st.session_state.gdf['丁目名'].notna().sum()
+                                st.sidebar.info(f"🏘️ 丁目データ: {chome_count}件")
+                            
+                            if '小字名' in st.session_state.gdf.columns:
+                                koaza_count = st.session_state.gdf['小字名'].notna().sum()
+                                st.sidebar.info(f"🏞️ 小字データ: {koaza_count}件")
+                            
+                            # データソース情報を記録
+                            st.session_state.data_source = "Webフォルダ"
+                            st.session_state.current_preset = selected_file
+                            st.session_state.file_info = selected_file_info['url']
+                                
+                        except Exception as e:
+                            st.sidebar.error(f"❌ ファイル読み込みエラー: {str(e)}")
+    
+    # 従来のプリセット機能（固定リスト）
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📋 固定プリセット")
+    
     # プリセットファイル機能
     preset_files = {
         "サンプル1": {
@@ -410,7 +647,7 @@ def main():
     
     # プリセット選択
     selected_preset = st.sidebar.selectbox(
-        "プリセットファイルを選択",
+        "固定プリセットファイルを選択",
         ["選択なし"] + list(preset_files.keys()),
         help="事前に設定されたサンプルファイルから選択できます"
     )
@@ -419,7 +656,7 @@ def main():
         preset_info = preset_files[selected_preset]
         st.sidebar.info(f"**{preset_info['name']}**\n\n{preset_info['description']}")
         
-        if st.sidebar.button("📋 プリセットファイルを読み込み", type="secondary"):
+        if st.sidebar.button("📋 固定プリセットを読み込み", type="secondary"):
             try:
                 with st.spinner(f"プリセット「{selected_preset}」を読み込み中..."):
                     st.session_state.gdf = extractor.load_shapefile_from_url(preset_info['url'])
@@ -440,7 +677,7 @@ def main():
                     st.sidebar.info(f"🏞️ 小字データ: {koaza_count}件")
                 
                 # データソース情報を記録
-                st.session_state.data_source = "プリセット"
+                st.session_state.data_source = "固定プリセット"
                 st.session_state.current_preset = selected_preset
                 st.session_state.file_info = preset_info['name']
                     
@@ -448,7 +685,7 @@ def main():
                 st.sidebar.error(f"❌ プリセット読み込みエラー: {str(e)}")
     
     st.sidebar.markdown("---")
-    st.sidebar.header("📂 データソース選択")
+    st.sidebar.header("📂 独自データソース選択")
     
     # データソース選択
     data_source = st.sidebar.radio(
@@ -681,8 +918,8 @@ def main():
             # 地番入力
             chiban = st.text_input("地番を入力", value="1174")
             
-            # 検索範囲
-            range_m = st.number_input("検索範囲 (m)", min_value=1, max_value=1000, value=61)
+            # 検索範囲を固定値に設定
+            range_m = 61
             
             # 抽出ボタン
             if st.button("🚀 データ抽出", type="primary", use_container_width=True):
@@ -724,7 +961,7 @@ def main():
         with col2:
             st.header("📊 データ一覧")
             
-            # 現在のデータソース情報
+            # 現在のデータソース情報（Webフォルダ情報を含む）
             if 'data_source' in st.session_state:
                 with st.expander("ℹ️ 現在のデータ情報"):
                     st.write(f"**データソース**: {st.session_state.data_source}")
@@ -732,6 +969,8 @@ def main():
                         st.write(f"**プリセット**: {st.session_state.current_preset}")
                     if 'file_info' in st.session_state:
                         st.write(f"**ファイル**: {st.session_state.file_info}")
+                    if 'current_folder_url' in st.session_state:
+                        st.write(f"**フォルダURL**: {st.session_state.current_folder_url}")
                     
                     if st.session_state.gdf is not None:
                         st.write(f"**レコード数**: {len(st.session_state.gdf):,}件")
@@ -749,6 +988,38 @@ def main():
                             koaza_count = st.session_state.gdf['小字名'].notna().sum()
                             total_count = len(st.session_state.gdf)
                             st.write(f"**小字データ**: {koaza_count}/{total_count}件 ({koaza_count/total_count*100:.1f}%)")
+            
+            # Webフォルダから取得したファイル一覧の表示
+            if 'current_web_files' in st.session_state and st.session_state.current_web_files:
+                if st.checkbox("🌐 Webフォルダファイル一覧を表示"):
+                    st.write(f"**📂 {st.session_state.current_folder_url}のファイル一覧:**")
+                    
+                    files_df = pd.DataFrame(st.session_state.current_web_files)
+                    
+                    # ファイル情報を整理して表示
+                    display_df = pd.DataFrame({
+                        'ファイル名': files_df['name'],
+                        '説明': files_df['description'],
+                        'サイズ': files_df['size'].apply(
+                            lambda x: f"{x:,} bytes" if x is not None else "不明"
+                        )
+                    })
+                    
+                    st.dataframe(display_df, use_container_width=True)
+                    
+                    # 更新ボタン
+                    if st.button("🔄 ファイル一覧を更新"):
+                        # キャッシュをクリア
+                        if 'web_files_cache' in st.session_state:
+                            st.session_state.web_files_cache.clear()
+                        
+                        with st.spinner("ファイル一覧を更新中..."):
+                            new_files = extractor.get_files_from_web_folder(st.session_state.current_folder_url)
+                            if new_files:
+                                st.session_state.current_web_files = new_files
+                                st.success(f"✅ {len(new_files)}個のファイルを取得しました")
+                            else:
+                                st.warning("❌ ファイルが見つかりませんでした")
             
             # 大字名・丁目名・小字名のサマリー
             if st.checkbox("大字名・丁目名・小字名一覧を表示"):
@@ -1029,7 +1300,7 @@ def main():
                 search_conditions = {
                     '大字名': selected_oaza if 'selected_oaza' in locals() else '不明',
                     '地番': chiban if 'chiban' in locals() else '不明',
-                    '検索範囲': f"{range_m}m" if 'range_m' in locals() else '不明'
+                    '検索範囲': "61m（固定）"
                 }
                 
                 if 'selected_chome' in locals() and selected_chome and selected_chome != "選択なし":
@@ -1059,22 +1330,38 @@ def main():
     else:
         st.info("👆 データソースを選択してファイルを読み込んでください")
         
-        # 使い方説明（改良版）
+        # 使い方説明（Webフォルダ機能を含む改良版）
         with st.expander("📖 使い方"):
             st.markdown("""
-            ### 📋 データソース
-            **1. ローカルファイル** 📁
+            ### 🌐 新機能: Webフォルダからのプリセット選択
+            **Webフォルダプリセット** 📂
+            - Web上のフォルダから複数のShapefileを自動取得
+            - GitHubフォルダ、一般的なWebディレクトリに対応
+            - ファイル一覧を動的に表示・選択可能
+            - 例: `https://github.com/user/repo/tree/main/data`
+            
+            **使用手順:**
+            1. **カスタムフォルダURL**を入力、または**サンプルフォルダ**を選択
+            2. **「フォルダからファイル一覧を取得」**ボタンをクリック
+            3. 取得されたファイル一覧から**目的のファイルを選択**
+            4. **「選択ファイルを読み込み」**ボタンでデータを読み込み
+            
+            ### 📋 データソース（従来機能）
+            **1. 固定プリセット** 📋
+            - 事前設定されたサンプルファイル
+            
+            **2. ローカルファイル** 📁
             - SHPファイル一式をZIP圧縮してアップロード
             
-            **2. Web URL** 🌐
+            **3. Web URL** 🌐
             - 直接アクセス可能なファイルのURL
             - 例: `https://example.com/data.zip`
             
-            **3. GitHub** 🐙
-            - GitHubリポジトリ内のファイル
+            **4. GitHub** 🐙
+            - GitHubリポジトリ内の個別ファイル
             - ユーザー名、リポジトリ名、ファイルパスを指定
             
-            ### 📋 手順
+            ### 📋 検索手順
             1. **データソース**を選択してファイルを読み込み
             2. **大字名**をドロップダウンから選択
             3. **丁目名**を選択（丁目データがある場合のみ表示）
@@ -1103,15 +1390,22 @@ def main():
             - QGIS
             - その他GISソフトウェア
             
-            ### 🔍 検索機能
+            ### 🔍 検索・分析機能
             - **地番検索**: 完全一致・部分一致での地番検索
             - **座標表示**: 検索結果に中心座標を表示可能
             - **データ構造確認**: 列情報、NULL値統計、サンプルデータの確認
             - **階層検索**: 大字名→丁目名→小字名の階層での絞り込み検索
+            - **Webフォルダファイル一覧**: 取得したファイルの詳細情報表示
+            - **統計情報**: 各地域区分の件数・割合の確認
             
-            ### 🔗 URL形式の例
+            ### 🔗 対応URL形式
+            **Webフォルダ:**
+            - **GitHubフォルダ**: `https://github.com/user/repo/tree/branch/path`
+            - **一般Webディレクトリ**: `https://example.com/data/`
+            
+            **個別ファイル:**
             - **直接URL**: `https://example.com/shapefile.zip`
-            - **GitHub**: `https://github.com/username/repo/blob/main/data.zip`
+            - **GitHub個別**: `https://github.com/username/repo/blob/main/data.zip`
             - **GitHub Raw**: `https://raw.githubusercontent.com/username/repo/main/data.zip`
             
             ### 📍 地域区分の階層
@@ -1121,6 +1415,13 @@ def main():
             │   └── 小字名 (任意)
             └── 小字名 (任意、丁目なしの場合)
             ```
+            
+            ### 💡 Webフォルダ機能の利点
+            - **複数ファイル管理**: 一つのフォルダに複数のShapefileを配置して管理
+            - **動的更新**: フォルダ内容の変更が即座に反映
+            - **バージョン管理**: GitHubを使用した場合、ファイルのバージョン管理が可能
+            - **共有**: チーム内でのデータ共有が容易
+            - **自動発見**: 対応拡張子のファイルを自動検出
             """)
 
 if __name__ == "__main__":
