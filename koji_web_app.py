@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-電子公図データ抽出Webアプリ (Streamlit版)
+電子公図データ抽出Webアプリ (Streamlit版) - Web/GitHub参照対応
 """
 
 import streamlit as st
@@ -13,6 +13,8 @@ import zipfile
 import io
 import tempfile
 import os
+import requests
+from urllib.parse import urlparse
 
 # ページ設定
 st.set_page_config(
@@ -25,6 +27,61 @@ class KojiWebExtractor:
     def __init__(self):
         if 'gdf' not in st.session_state:
             st.session_state.gdf = None
+    
+    def download_file_from_url(self, url):
+        """URLからファイルをダウンロード"""
+        try:
+            # GitHubの生ファイルURLに変換
+            if 'github.com' in url and '/blob/' in url:
+                url = url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
+            
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            
+            return io.BytesIO(response.content)
+            
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"ファイルのダウンロードに失敗しました: {str(e)}")
+    
+    def load_shapefile_from_url(self, url):
+        """URLからShapefileを読み込み"""
+        try:
+            file_obj = self.download_file_from_url(url)
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # ZIPファイルとして展開を試行
+                try:
+                    with zipfile.ZipFile(file_obj, 'r') as zip_ref:
+                        zip_ref.extractall(temp_dir)
+                    
+                    # SHPファイルを探す
+                    shp_files = [f for f in os.listdir(temp_dir) if f.endswith('.shp')]
+                    
+                    if shp_files:
+                        shp_path = os.path.join(temp_dir, shp_files[0])
+                        return gpd.read_file(shp_path)
+                    else:
+                        raise Exception("ZIPファイル内にSHPファイルが見つかりません")
+                        
+                except zipfile.BadZipFile:
+                    # ZIPファイルでない場合、直接SHPファイルとして読み込みを試行
+                    file_obj.seek(0)  # ファイルポインタをリセット
+                    
+                    # 一時的にファイルを保存
+                    temp_file = os.path.join(temp_dir, "temp_file")
+                    with open(temp_file, 'wb') as f:
+                        f.write(file_obj.read())
+                    
+                    # 拡張子を推測してリネーム
+                    if url.lower().endswith('.shp'):
+                        shp_file = temp_file + '.shp'
+                        os.rename(temp_file, shp_file)
+                        return gpd.read_file(shp_file)
+                    else:
+                        return gpd.read_file(temp_file)
+                        
+        except Exception as e:
+            raise Exception(f"Shapefileの読み込みに失敗しました: {str(e)}")
     
     def create_kml_from_geodataframe(self, gdf, name="地番データ"):
         """GeoPandasデータフレームからKMLファイルを作成（座標変換付き）"""
@@ -194,41 +251,270 @@ def main():
     extractor = KojiWebExtractor()
     
     # サイドバー
-    st.sidebar.header("📂 ファイルアップロード")
+    st.sidebar.header("📂 データソース選択")
     
-    # ファイルアップロード
-    uploaded_file = st.sidebar.file_uploader(
-        "SHPファイルをアップロード",
-        type=['zip'],
-        help="SHPファイル一式をZIPで圧縮してアップロードしてください"
+    # データソース選択
+    data_source = st.sidebar.radio(
+        "データソースを選択してください",
+        ["📁 ローカルファイル", "🌐 Web URL", "🐙 GitHub"],
+        help="データの取得方法を選択してください"
     )
     
-    if uploaded_file is not None:
-        try:
-            # ZIPファイルを展開してSHPファイルを読み込み
-            with tempfile.TemporaryDirectory() as temp_dir:
-                # ZIPファイルを展開
-                with zipfile.ZipFile(uploaded_file, 'r') as zip_ref:
-                    zip_ref.extractall(temp_dir)
-                
-                # SHPファイルを探す
-                shp_files = [f for f in os.listdir(temp_dir) if f.endswith('.shp')]
-                
-                if shp_files:
-                    shp_path = os.path.join(temp_dir, shp_files[0])
-                    st.session_state.gdf = gpd.read_file(shp_path)
+    if data_source == "📁 ローカルファイル":
+        # 従来のファイルアップロード
+        uploaded_file = st.sidebar.file_uploader(
+            "SHPファイルをアップロード",
+            type=['zip'],
+            help="SHPファイル一式をZIPで圧縮してアップロードしてください"
+        )
+        
+        if uploaded_file is not None:
+            try:
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    # ZIPファイルを展開
+                    with zipfile.ZipFile(uploaded_file, 'r') as zip_ref:
+                        zip_ref.extractall(temp_dir)
+                    
+                    # SHPファイルを探す
+                    shp_files = [f for f in os.listdir(temp_dir) if f.endswith('.shp')]
+                    
+                    if shp_files:
+                        shp_path = os.path.join(temp_dir, shp_files[0])
+                        st.session_state.gdf = gpd.read_file(shp_path)
+                        
+                        st.sidebar.success("✅ ファイル読み込み完了!")
+                        st.sidebar.info(f"📊 レコード数: {len(st.session_state.gdf):,}件")
+                        
+                        # 座標参照系の確認
+                        if st.session_state.gdf.crs:
+                            st.sidebar.info(f"🗺️ 座標系: {st.session_state.gdf.crs}")
+                        
+                        # データソース情報を記録
+                        st.session_state.data_source = "ローカルファイル"
+                        st.session_state.file_info = uploaded_file.name
+                    else:
+                        st.sidebar.error("❌ SHPファイルが見つかりません")
+                        
+            except Exception as e:
+                st.sidebar.error(f"❌ ファイル読み込みエラー: {str(e)}")
+    
+    elif data_source == "🌐 Web URL":
+        # Web URL入力
+        web_url = st.sidebar.text_input(
+            "ファイルのURL",
+            placeholder="https://example.com/data.zip",
+            help="ZIPファイルまたはSHPファイルの直接URLを入力してください"
+        )
+        
+        if st.sidebar.button("🌐 URLから読み込み", type="primary"):
+            if web_url:
+                try:
+                    with st.spinner("URLからファイルを読み込み中..."):
+                        st.session_state.gdf = extractor.load_shapefile_from_url(web_url)
                     
                     st.sidebar.success("✅ ファイル読み込み完了!")
                     st.sidebar.info(f"📊 レコード数: {len(st.session_state.gdf):,}件")
                     
-                    # 座標参照系の確認
                     if st.session_state.gdf.crs:
                         st.sidebar.info(f"🗺️ 座標系: {st.session_state.gdf.crs}")
-                else:
-                    st.sidebar.error("❌ SHPファイルが見つかりません")
                     
-        except Exception as e:
-            st.sidebar.error(f"❌ ファイル読み込みエラー: {str(e)}")
+                    # データソース情報を記録
+                    st.session_state.data_source = "GitHub"
+                    st.session_state.file_info = github_url
+                    
+                    # データソース情報を記録
+                    st.session_state.data_source = "Web URL"
+                    st.session_state.file_info = web_url
+                        
+                except Exception as e:
+                    st.sidebar.error(f"❌ {str(e)}")
+            else:
+                st.sidebar.error("URLを入力してください")
+    
+    elif data_source == "🐙 GitHub":
+        # GitHub URL入力
+        col_owner, col_repo = st.sidebar.columns(2)
+        with col_owner:
+            github_owner = st.text_input("GitHubユーザー名", placeholder="username")
+        with col_repo:
+            github_repo = st.text_input("リポジトリ名", placeholder="repository")
+        
+        github_path = st.sidebar.text_input(
+            "ファイルパス",
+            placeholder="data/shapefile.zip",
+            help="リポジトリ内のファイルパスを入力してください"
+        )
+        
+        github_branch = st.sidebar.text_input("ブランチ名", value="main")
+        
+        if st.sidebar.button("🐙 GitHubから読み込み", type="primary"):
+            if github_owner and github_repo and github_path:
+                try:
+                    github_url = f"https://github.com/{github_owner}/{github_repo}/blob/{github_branch}/{github_path}"
+                    
+                    with st.spinner("GitHubからファイルを読み込み中..."):
+                        st.session_state.gdf = extractor.load_shapefile_from_url(github_url)
+                    
+                    st.sidebar.success("✅ ファイル読み込み完了!")
+                    st.sidebar.info(f"📊 レコード数: {len(st.session_state.gdf):,}件")
+                    
+                    if st.session_state.gdf.crs:
+                        st.sidebar.info(f"🗺️ 座標系: {st.session_state.gdf.crs}")
+                        
+                except Exception as e:
+                    st.sidebar.error(f"❌ {str(e)}")
+            else:
+                st.sidebar.error("GitHubの情報をすべて入力してください")
+    
+    # プリセットファイル機能
+    with st.sidebar.expander("📋 プリセットファイル"):
+        st.markdown("**よく使用するデータセット**")
+        
+        # プリセット設定（実際の使用時は設定ファイルやデータベースから読み込み）
+        presets = {
+            "🏙️ 東京都市部サンプル": {
+                "url": "https://raw.githubusercontent.com/example/tokyo-data/main/tokyo_sample.zip",
+                "description": "東京都心部の公図データサンプル"
+            },
+            "🌾 農村部サンプル": {
+                "url": "https://raw.githubusercontent.com/example/rural-data/main/rural_sample.zip", 
+                "description": "農村部の公図データサンプル"
+            },
+            "🏖️ 沖縄県データ": {
+                "url": "https://raw.githubusercontent.com/okinawa-gis/public-data/main/okinawa_koji.zip",
+                "description": "沖縄県の公図データ（仮想）"
+            },
+            "🗾 全国統合データ": {
+                "url": "https://example.com/national_koji_data.zip",
+                "description": "全国の公図データ統合版"
+            }
+        }
+        
+        # プリセット選択
+        selected_preset = st.selectbox(
+            "プリセットを選択",
+            ["選択してください..."] + list(presets.keys()),
+            help="事前に設定された地理データから選択できます"
+        )
+        
+        if selected_preset != "選択してください...":
+            preset_info = presets[selected_preset]
+            st.info(f"📝 {preset_info['description']}")
+            st.code(preset_info['url'], language="text")
+            
+            if st.button("🚀 プリセットデータを読み込み", type="primary"):
+                try:
+                    with st.spinner(f"{selected_preset}を読み込み中..."):
+                        st.session_state.gdf = extractor.load_shapefile_from_url(preset_info['url'])
+                    
+                    st.success(f"✅ {selected_preset}を読み込み完了!")
+                    st.info(f"📊 レコード数: {len(st.session_state.gdf):,}件")
+                    
+                    if st.session_state.gdf.crs:
+                        st.info(f"🗺️ 座標系: {st.session_state.gdf.crs}")
+                        
+                    # プリセット名を記録
+                    st.session_state.current_preset = selected_preset
+                        
+                except Exception as e:
+                    st.error(f"❌ {str(e)}")
+        
+        st.markdown("---")
+        
+        # カスタムプリセット追加機能
+        st.markdown("**カスタムプリセット追加**")
+        
+        with st.form("add_preset_form"):
+            new_preset_name = st.text_input("プリセット名", placeholder="例: 私の地域データ")
+            new_preset_url = st.text_input("データURL", placeholder="https://...")
+            new_preset_desc = st.text_area("説明", placeholder="このデータセットの説明...")
+            
+            if st.form_submit_button("➕ プリセットに追加"):
+                if new_preset_name and new_preset_url:
+                    # セッション状態にカスタムプリセットを保存
+                    if 'custom_presets' not in st.session_state:
+                        st.session_state.custom_presets = {}
+                    
+                    st.session_state.custom_presets[f"🔧 {new_preset_name}"] = {
+                        "url": new_preset_url,
+                        "description": new_preset_desc or "カスタムデータセット"
+                    }
+                    
+                    st.success(f"✅ '{new_preset_name}'をプリセットに追加しました")
+                    st.rerun()
+                else:
+                    st.error("プリセット名とURLは必須です")
+        
+        # カスタムプリセット表示
+        if 'custom_presets' in st.session_state and st.session_state.custom_presets:
+            st.markdown("**マイプリセット**")
+            
+            for preset_name, preset_info in st.session_state.custom_presets.items():
+                col1, col2 = st.columns([3, 1])
+                
+                with col1:
+                    if st.button(f"📂 {preset_name}", key=f"custom_{preset_name}"):
+                        try:
+                            with st.spinner(f"{preset_name}を読み込み中..."):
+                                st.session_state.gdf = extractor.load_shapefile_from_url(preset_info['url'])
+                            
+                            st.success(f"✅ {preset_name}を読み込み完了!")
+                            st.info(f"📊 レコード数: {len(st.session_state.gdf):,}件")
+                            
+                            if st.session_state.gdf.crs:
+                                st.info(f"🗺️ 座標系: {st.session_state.gdf.crs}")
+                                
+                            st.session_state.current_preset = preset_name
+                                
+                        except Exception as e:
+                            st.error(f"❌ {str(e)}")
+                
+                with col2:
+                    if st.button("🗑️", key=f"delete_{preset_name}", help="削除"):
+                        del st.session_state.custom_presets[preset_name]
+                        st.rerun()
+        
+        # プリセット管理機能
+        st.markdown("---")
+        st.markdown("**プリセット管理**")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("📤 プリセットエクスポート", help="現在のプリセットをJSONで出力"):
+                if 'custom_presets' in st.session_state and st.session_state.custom_presets:
+                    import json
+                    preset_json = json.dumps(st.session_state.custom_presets, indent=2, ensure_ascii=False)
+                    st.download_button(
+                        "📁 presets.json",
+                        data=preset_json,
+                        file_name="my_presets.json",
+                        mime="application/json"
+                    )
+                else:
+                    st.info("カスタムプリセットがありません")
+        
+        with col2:
+            uploaded_presets = st.file_uploader(
+                "📥 プリセットインポート",
+                type=['json'],
+                help="以前エクスポートしたpresets.jsonを読み込み"
+            )
+            
+            if uploaded_presets is not None:
+                try:
+                    import json
+                    imported_presets = json.load(uploaded_presets)
+                    
+                    if 'custom_presets' not in st.session_state:
+                        st.session_state.custom_presets = {}
+                    
+                    st.session_state.custom_presets.update(imported_presets)
+                    st.success(f"✅ {len(imported_presets)}個のプリセットをインポートしました")
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"❌ インポートエラー: {str(e)}")
     
     # メインエリア
     if st.session_state.gdf is not None:
@@ -267,6 +553,21 @@ def main():
         
         with col2:
             st.header("📊 データ一覧")
+            
+            # 現在のデータソース情報
+            if 'data_source' in st.session_state:
+                with st.expander("ℹ️ 現在のデータ情報"):
+                    st.write(f"**データソース**: {st.session_state.data_source}")
+                    if 'current_preset' in st.session_state:
+                        st.write(f"**プリセット**: {st.session_state.current_preset}")
+                    if 'file_info' in st.session_state:
+                        st.write(f"**ファイル**: {st.session_state.file_info}")
+                    
+                    if st.session_state.gdf is not None:
+                        st.write(f"**レコード数**: {len(st.session_state.gdf):,}件")
+                        st.write(f"**カラム数**: {len(st.session_state.gdf.columns)}個")
+                        if st.session_state.gdf.crs:
+                            st.write(f"**座標系**: {st.session_state.gdf.crs}")
             
             # 大字名のサマリー
             if st.checkbox("大字名一覧を表示"):
@@ -355,13 +656,25 @@ def main():
                     st.dataframe(display_df, use_container_width=True)
     
     else:
-        st.info("👆 SHPファイル（ZIP形式）をアップロードしてください")
+        st.info("👆 データソースを選択してファイルを読み込んでください")
         
         # 使い方説明
         with st.expander("📖 使い方"):
             st.markdown("""
+            ### 📋 データソース
+            **1. ローカルファイル** 📁
+            - SHPファイル一式をZIP圧縮してアップロード
+            
+            **2. Web URL** 🌐
+            - 直接アクセス可能なファイルのURL
+            - 例: `https://example.com/data.zip`
+            
+            **3. GitHub** 🐙
+            - GitHubリポジトリ内のファイル
+            - ユーザー名、リポジトリ名、ファイルパスを指定
+            
             ### 📋 手順
-            1. **SHPファイル一式をZIP圧縮**してアップロード
+            1. **データソース**を選択してファイルを読み込み
             2. **大字名**をドロップダウンから選択
             3. **地番**を入力
             4. **検索範囲**を設定（デフォルト: 61m）
@@ -378,6 +691,11 @@ def main():
             - Google マイマップ
             - QGIS
             - その他GISソフトウェア
+            
+            ### 🔗 URL形式の例
+            - **直接URL**: `https://example.com/shapefile.zip`
+            - **GitHub**: `https://github.com/username/repo/blob/main/data.zip`
+            - **GitHub Raw**: `https://raw.githubusercontent.com/username/repo/main/data.zip`
             """)
 
 if __name__ == "__main__":
