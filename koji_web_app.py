@@ -197,11 +197,37 @@ class KojiWebExtractor:
             if missing_columns:
                 return None, None, f"必要な列が見つかりません: {missing_columns}"
             
-            # 指定した筆を検索
-            df = gdf[(gdf['大字名'] == oaza) & (gdf['地番'] == chiban)]
+            # NULL値をチェック
+            null_check = {}
+            for col in required_columns:
+                null_count = gdf[col].isnull().sum()
+                if null_count > 0:
+                    null_check[col] = null_count
+            
+            if null_check:
+                warning_msg = "警告: NULL値が含まれています - " + ", ".join([f"{k}: {v}件" for k, v in null_check.items()])
+                st.warning(warning_msg)
+            
+            # 指定した筆を検索（NULL値を除外）
+            search_condition = (
+                (gdf['大字名'] == oaza) & 
+                (gdf['地番'] == chiban) &
+                (gdf['大字名'].notna()) &
+                (gdf['地番'].notna())
+            )
+            
+            df = gdf[search_condition]
             
             if df.empty:
-                return None, None, "該当する筆が見つかりませんでした"
+                # デバッグ情報を提供
+                debug_info = []
+                oaza_matches = gdf[gdf['大字名'] == oaza]['大字名'].count()
+                chiban_matches = gdf[gdf['地番'] == chiban]['地番'].count()
+                
+                debug_info.append(f"大字名'{oaza}'の該当件数: {oaza_matches}")
+                debug_info.append(f"地番'{chiban}'の該当件数: {chiban_matches}")
+                
+                return None, None, f"該当する筆が見つかりませんでした。{' / '.join(debug_info)}"
             
             # 利用可能な列のみを選択
             available_columns = ["大字名", "地番", "geometry"]
@@ -212,12 +238,19 @@ class KojiWebExtractor:
             existing_columns = [col for col in available_columns if col in df.columns]
             df_summary = df.reindex(columns=existing_columns)
             
+            # geometryカラムが存在し、有効かチェック
+            if 'geometry' not in df_summary.columns:
+                return None, None, "geometry列が見つかりません"
+            
+            if df_summary['geometry'].isnull().any():
+                return None, None, "geometry列にNULL値が含まれています"
+            
             # 中心点計算と周辺筆抽出
-            cen = df_summary.centroid
+            cen = df_summary.geometry.centroid
             
             cen_gdf = gpd.GeoDataFrame(geometry=cen)
-            cen_gdf['x'] = cen_gdf['geometry'].x
-            cen_gdf['y'] = cen_gdf['geometry'].y
+            cen_gdf['x'] = cen_gdf.geometry.x
+            cen_gdf['y'] = cen_gdf.geometry.y
             
             # 検索範囲の4角ポイント計算
             i1 = cen_gdf['x'] + range_m
@@ -245,10 +278,13 @@ class KojiWebExtractor:
             # 検索範囲のポリゴン作成
             sq = four_points_gdf.dissolve().convex_hull
             
-            # オーバーレイ処理
+            # オーバーレイ処理（NULL値を除外したデータで）
             df1 = gpd.GeoDataFrame({'geometry': sq})
             df1 = df1.set_crs(gdf.crs)
-            df2 = gpd.GeoDataFrame({'地番': gdf['地番'], 'geometry': gdf['geometry']})
+            
+            # 地番とgeometryが両方とも有効なデータのみを使用
+            valid_data = gdf[(gdf['地番'].notna()) & (gdf['geometry'].notna())].copy()
+            df2 = gpd.GeoDataFrame({'地番': valid_data['地番'], 'geometry': valid_data['geometry']})
             
             overlay_gdf = df1.overlay(df2, how='intersection')
             
@@ -385,9 +421,9 @@ def main():
         
         # プリセット設定（実際の使用時は設定ファイルやデータベースから読み込み）
         presets = {
-            "那覇市": {
-                "url": "https://github.com/kentashimoji/koji-data-extractor/blob/3543a268a6e5ee8edea2934bac056742738291fa/47okinawa/47201_%E9%82%A3%E8%A6%87%E5%B8%82_%E5%85%AC%E5%85%B1%E5%BA%A7%E6%A8%9915%E7%B3%BB_%E7%AD%86R_2025.zip",
-                "description": "那覇市"
+            "🏙️ 東京都市部サンプル": {
+                "url": "https://raw.githubusercontent.com/example/tokyo-data/main/tokyo_sample.zip",
+                "description": "東京都心部の公図データサンプル"
             },
             "🌾 農村部サンプル": {
                 "url": "https://raw.githubusercontent.com/example/rural-data/main/rural_sample.zip", 
@@ -437,26 +473,168 @@ def main():
         # カスタムプリセット追加機能
         st.markdown("**カスタムプリセット追加**")
         
-        with st.form("add_preset_form"):
-            new_preset_name = st.text_input("プリセット名", placeholder="例: 私の地域データ")
-            new_preset_url = st.text_input("データURL", placeholder="https://...")
-            new_preset_desc = st.text_area("説明", placeholder="このデータセットの説明...")
-            
-            if st.form_submit_button("➕ プリセットに追加"):
-                if new_preset_name and new_preset_url:
-                    # セッション状態にカスタムプリセットを保存
-                    if 'custom_presets' not in st.session_state:
-                        st.session_state.custom_presets = {}
-                    
-                    st.session_state.custom_presets[f"🔧 {new_preset_name}"] = {
-                        "url": new_preset_url,
-                        "description": new_preset_desc or "カスタムデータセット"
-                    }
-                    
-                    st.success(f"✅ '{new_preset_name}'をプリセットに追加しました")
-                    st.rerun()
-                else:
-                    st.error("プリセット名とURLは必須です")
+        # 追加方法の選択
+        add_method = st.radio(
+            "追加方法を選択",
+            ["📝 個別追加", "📁 フォルダ一括追加", "🌐 URL一括追加"],
+            horizontal=True
+        )
+        
+        if add_method == "📝 個別追加":
+            with st.form("add_preset_form"):
+                new_preset_name = st.text_input("プリセット名", placeholder="例: 私の地域データ")
+                new_preset_url = st.text_input("データURL", placeholder="https://...")
+                new_preset_desc = st.text_area("説明", placeholder="このデータセットの説明...")
+                
+                if st.form_submit_button("➕ プリセットに追加"):
+                    if new_preset_name and new_preset_url:
+                        # セッション状態にカスタムプリセットを保存
+                        if 'custom_presets' not in st.session_state:
+                            st.session_state.custom_presets = {}
+                        
+                        st.session_state.custom_presets[f"🔧 {new_preset_name}"] = {
+                            "url": new_preset_url,
+                            "description": new_preset_desc or "カスタムデータセット"
+                        }
+                        
+                        st.success(f"✅ '{new_preset_name}'をプリセットに追加しました")
+                        st.rerun()
+                    else:
+                        st.error("プリセット名とURLは必須です")
+        
+        elif add_method == "📁 フォルダ一括追加":
+            with st.form("folder_preset_form"):
+                st.markdown("**フォルダベースURL設定**")
+                base_url = st.text_input(
+                    "ベースURL", 
+                    placeholder="https://example.com/data/",
+                    help="フォルダのベースURLを入力してください"
+                )
+                
+                file_list_input = st.text_area(
+                    "ファイルリスト（改行区切り）",
+                    placeholder="""tokyo_area1.zip
+tokyo_area2.zip
+osaka_central.zip
+kyoto_historical.zip""",
+                    help="フォルダ内のファイル名を改行区切りで入力してください",
+                    height=150
+                )
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    prefix = st.text_input("プリセット名プレフィックス", value="📁", help="例: 📁, 🏢, 🌍")
+                with col2:
+                    auto_description = st.checkbox("自動説明生成", value=True, help="ファイル名から説明を自動生成")
+                
+                if st.form_submit_button("📁 フォルダ一括追加"):
+                    if base_url and file_list_input:
+                        # ベースURLの末尾にスラッシュを追加
+                        if not base_url.endswith('/'):
+                            base_url += '/'
+                        
+                        file_list = [f.strip() for f in file_list_input.split('\n') if f.strip()]
+                        
+                        if 'custom_presets' not in st.session_state:
+                            st.session_state.custom_presets = {}
+                        
+                        added_count = 0
+                        for filename in file_list:
+                            # ファイル名からプリセット名を生成
+                            preset_name = filename.replace('.zip', '').replace('.shp', '').replace('_', ' ').title()
+                            full_preset_name = f"{prefix} {preset_name}"
+                            
+                            # 説明の生成
+                            if auto_description:
+                                description = f"{preset_name}の地理データ（{filename}）"
+                            else:
+                                description = f"フォルダから追加: {filename}"
+                            
+                            # プリセットに追加
+                            st.session_state.custom_presets[full_preset_name] = {
+                                "url": base_url + filename,
+                                "description": description
+                            }
+                            added_count += 1
+                        
+                        st.success(f"✅ {added_count}個のプリセットを追加しました")
+                        st.rerun()
+                    else:
+                        st.error("ベースURLとファイルリストは必須です")
+        
+        elif add_method == "🌐 URL一括追加":
+            with st.form("batch_url_form"):
+                st.markdown("**URL一括追加**")
+                url_list_input = st.text_area(
+                    "URLリスト（改行区切り）",
+                    placeholder="""https://example.com/data1.zip
+https://github.com/user/repo/blob/main/data2.zip
+https://raw.githubusercontent.com/user/repo/main/data3.zip""",
+                    help="複数のURLを改行区切りで入力してください",
+                    height=150
+                )
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    url_prefix = st.text_input("プリセット名プレフィックス", value="🌐", help="例: 🌐, 📊, 🗂️")
+                with col2:
+                    extract_name_method = st.selectbox(
+                        "名前抽出方法",
+                        ["ファイル名から", "URLの最後の部分", "手動入力"],
+                        help="プリセット名の生成方法を選択"
+                    )
+                
+                if extract_name_method == "手動入力":
+                    name_list_input = st.text_area(
+                        "プリセット名リスト（改行区切り）",
+                        placeholder="""東京データセット1
+大阪中央エリア
+京都歴史地区""",
+                        help="URLと同じ順序でプリセット名を入力してください"
+                    )
+                
+                if st.form_submit_button("🌐 URL一括追加"):
+                    if url_list_input:
+                        url_list = [url.strip() for url in url_list_input.split('\n') if url.strip()]
+                        
+                        if extract_name_method == "手動入力":
+                            if 'name_list_input' in locals() and name_list_input:
+                                name_list = [name.strip() for name in name_list_input.split('\n') if name.strip()]
+                                if len(name_list) != len(url_list):
+                                    st.error("URLの数とプリセット名の数が一致しません")
+                                    st.stop()
+                            else:
+                                st.error("手動入力を選択した場合はプリセット名リストが必要です")
+                                st.stop()
+                        
+                        if 'custom_presets' not in st.session_state:
+                            st.session_state.custom_presets = {}
+                        
+                        added_count = 0
+                        for i, url in enumerate(url_list):
+                            # プリセット名の生成
+                            if extract_name_method == "ファイル名から":
+                                filename = url.split('/')[-1]
+                                preset_name = filename.replace('.zip', '').replace('.shp', '').replace('_', ' ').replace('-', ' ').title()
+                            elif extract_name_method == "URLの最後の部分":
+                                preset_name = url.split('/')[-2] if url.endswith('/') else url.split('/')[-1]
+                                preset_name = preset_name.replace('_', ' ').replace('-', ' ').title()
+                            else:  # 手動入力
+                                preset_name = name_list[i]
+                            
+                            full_preset_name = f"{url_prefix} {preset_name}"
+                            
+                            # プリセットに追加
+                            st.session_state.custom_presets[full_preset_name] = {
+                                "url": url,
+                                "description": f"URL一括追加: {preset_name}"
+                            }
+                            added_count += 1
+                        
+                        st.success(f"✅ {added_count}個のプリセットを追加しました")
+                        st.rerun()
+                    else:
+                        st.error("URLリストは必須です")
         
         # カスタムプリセット表示
         if 'custom_presets' in st.session_state and st.session_state.custom_presets:
@@ -491,7 +669,7 @@ def main():
         st.markdown("---")
         st.markdown("**プリセット管理**")
         
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         
         with col1:
             if st.button("📤 プリセットエクスポート", help="現在のプリセットをJSONで出力"):
@@ -528,6 +706,76 @@ def main():
                     
                 except Exception as e:
                     st.error(f"❌ インポートエラー: {str(e)}")
+        
+        with col3:
+            if st.button("🗑️ 全プリセット削除", help="すべてのカスタムプリセットを削除"):
+                if 'custom_presets' in st.session_state:
+                    count = len(st.session_state.custom_presets)
+                    st.session_state.custom_presets = {}
+                    st.success(f"✅ {count}個のプリセットを削除しました")
+                    st.rerun()
+                else:
+                    st.info("削除するプリセットがありません")
+        
+        # プリセットテンプレート機能
+        st.markdown("---")
+        st.markdown("**📋 プリセットテンプレート**")
+        
+        template_option = st.selectbox(
+            "テンプレートを選択",
+            [
+                "選択してください...",
+                "🏙️ 都市部データセット",
+                "🌾 農村部データセット", 
+                "🏢 企業・組織向け",
+                "🎓 教育・研究機関向け",
+                "🏛️ 行政機関向け"
+            ]
+        )
+        
+        if template_option != "選択してください...":
+            if st.button(f"📋 {template_option}テンプレートを適用"):
+                templates = {
+                    "🏙️ 都市部データセット": {
+                        "🏙️ 東京23区": {"url": "https://example.com/tokyo23.zip", "description": "東京23区の詳細公図データ"},
+                        "🏙️ 大阪市中央": {"url": "https://example.com/osaka_central.zip", "description": "大阪市中央区の公図データ"},
+                        "🏙️ 名古屋中区": {"url": "https://example.com/nagoya_naka.zip", "description": "名古屋市中区の公図データ"},
+                        "🏙️ 横浜みなとみらい": {"url": "https://example.com/yokohama_mm.zip", "description": "横浜みなとみらい地区"}
+                    },
+                    "🌾 農村部データセット": {
+                        "🌾 北海道十勝": {"url": "https://example.com/hokkaido_tokachi.zip", "description": "北海道十勝地方の農地データ"},
+                        "🌾 新潟平野": {"url": "https://example.com/niigata_plain.zip", "description": "新潟平野の水田地帯"},
+                        "🌾 熊本県阿蘇": {"url": "https://example.com/kumamoto_aso.zip", "description": "熊本県阿蘇地域の農地"},
+                        "🌾 長野県佐久": {"url": "https://example.com/nagano_saku.zip", "description": "長野県佐久地方の高原農業地帯"}
+                    },
+                    "🏢 企業・組織向け": {
+                        "🏢 本社周辺": {"url": "https://company-server.com/hq_area.zip", "description": "本社周辺の詳細データ"},
+                        "🏭 工場エリアA": {"url": "https://company-server.com/factory_a.zip", "description": "A工場の敷地境界データ"},
+                        "🏭 工場エリアB": {"url": "https://company-server.com/factory_b.zip", "description": "B工場の敷地境界データ"},
+                        "📊 月次更新データ": {"url": "https://company-server.com/monthly_latest.zip", "description": "毎月更新される最新データ"}
+                    },
+                    "🎓 教育・研究機関向け": {
+                        "🎓 キャンパス全体": {"url": "https://univ-server.edu/campus_all.zip", "description": "大学キャンパス全体の地図データ"},
+                        "🔬 研究施設エリア": {"url": "https://univ-server.edu/research_area.zip", "description": "研究施設周辺のデータ"},
+                        "📚 図書館周辺": {"url": "https://univ-server.edu/library_area.zip", "description": "図書館周辺の詳細地図"},
+                        "🏟️ 体育施設": {"url": "https://univ-server.edu/sports_area.zip", "description": "体育施設エリアのデータ"}
+                    },
+                    "🏛️ 行政機関向け": {
+                        "🏛️ 庁舎周辺": {"url": "https://city-server.go.jp/city_hall.zip", "description": "市庁舎周辺の公図データ"},
+                        "🏥 公共施設": {"url": "https://city-server.go.jp/public_facilities.zip", "description": "公共施設の位置データ"},
+                        "🚌 交通インフラ": {"url": "https://city-server.go.jp/transport.zip", "description": "交通インフラ関連データ"},
+                        "🌳 公園緑地": {"url": "https://city-server.go.jp/parks.zip", "description": "公園・緑地のデータ"}
+                    }
+                }
+                
+                if 'custom_presets' not in st.session_state:
+                    st.session_state.custom_presets = {}
+                
+                template_presets = templates[template_option]
+                st.session_state.custom_presets.update(template_presets)
+                
+                st.success(f"✅ {template_option}テンプレート（{len(template_presets)}個）を適用しました")
+                st.rerun()
     
     # メインエリア
     if st.session_state.gdf is not None:
@@ -539,14 +787,29 @@ def main():
             # 大字名選択（データが存在する場合のみ）
             try:
                 if '大字名' in st.session_state.gdf.columns:
-                    oaza_list = sorted(st.session_state.gdf['大字名'].unique())
-                    selected_oaza = st.selectbox("大字名を選択", oaza_list)
+                    # NULL値を除外してソート
+                    oaza_series = st.session_state.gdf['大字名'].dropna()
+                    if len(oaza_series) > 0:
+                        oaza_list = sorted(oaza_series.unique())
+                        selected_oaza = st.selectbox("大字名を選択", oaza_list)
+                    else:
+                        st.error("❌ 大字名データがすべてNULLです")
+                        selected_oaza = None
                 else:
                     st.error("❌ '大字名'列が見つかりません。データの形式を確認してください。")
                     st.write("**利用可能な列:**", list(st.session_state.gdf.columns))
                     selected_oaza = None
             except Exception as e:
                 st.error(f"❌ データ読み込みエラー: {str(e)}")
+                st.write("**デバッグ情報:**")
+                try:
+                    oaza_info = st.session_state.gdf['大字名'].describe()
+                    st.write("大字名列の統計:", oaza_info)
+                    st.write("NULL値の数:", st.session_state.gdf['大字名'].isnull().sum())
+                    st.write("ユニーク値の数:", st.session_state.gdf['大字名'].nunique())
+                    st.write("データ型:", st.session_state.gdf['大字名'].dtype)
+                except:
+                    st.write("詳細情報の取得に失敗しました")
                 selected_oaza = None
             
             # 地番入力
@@ -605,8 +868,18 @@ def main():
             if st.checkbox("大字名一覧を表示"):
                 try:
                     if '大字名' in st.session_state.gdf.columns:
-                        oaza_summary = st.session_state.gdf['大字名'].value_counts()
-                        st.dataframe(oaza_summary.head(20), use_container_width=True)
+                        # NULL値を除外して集計
+                        oaza_clean = st.session_state.gdf['大字名'].dropna()
+                        if len(oaza_clean) > 0:
+                            oaza_summary = oaza_clean.value_counts()
+                            st.dataframe(oaza_summary.head(20), use_container_width=True)
+                            
+                            # NULL値の情報も表示
+                            null_count = st.session_state.gdf['大字名'].isnull().sum()
+                            if null_count > 0:
+                                st.warning(f"⚠️ NULL値が{null_count}件あります")
+                        else:
+                            st.error("大字名データがすべてNULLまたは空です")
                     else:
                         st.warning("'大字名'列が見つかりません")
                 except Exception as e:
@@ -618,8 +891,13 @@ def main():
                 if search_term:
                     try:
                         if '地番' in st.session_state.gdf.columns:
+                            # 地番をstring型に変換してから検索（NULL値も考慮）
+                            chiban_str = st.session_state.gdf['地番'].astype(str)
+                            # 'nan'文字列も除外
                             filtered = st.session_state.gdf[
-                                st.session_state.gdf['地番'].astype(str).str.contains(search_term, na=False)
+                                (chiban_str.str.contains(search_term, na=False)) & 
+                                (chiban_str != 'nan') & 
+                                (st.session_state.gdf['地番'].notna())
                             ]
                             
                             # 表示用の列を選択
@@ -628,17 +906,22 @@ def main():
                                 if col in filtered.columns:
                                     display_columns.append(col)
                             
-                            if display_columns:
+                            if display_columns and len(filtered) > 0:
                                 st.dataframe(
                                     filtered[display_columns].head(20),
                                     use_container_width=True
                                 )
+                            elif len(filtered) == 0:
+                                st.info(f"'{search_term}'に一致する地番が見つかりませんでした")
                             else:
                                 st.warning("表示可能な列が見つかりません")
                         else:
                             st.warning("'地番'列が見つかりません")
                     except Exception as e:
                         st.error(f"検索エラー: {str(e)}")
+                        # デバッグ情報
+                        st.write("地番列のデータ型:", st.session_state.gdf['地番'].dtype)
+                        st.write("地番列のNULL数:", st.session_state.gdf['地番'].isnull().sum())
             
             # データ構造の確認
             if st.checkbox("📋 データ構造を確認"):
