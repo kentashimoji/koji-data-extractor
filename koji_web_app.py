@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-電子公図データ抽出Webアプリ (Streamlit版) - Web/GitHub参照対応 - 丁目選択機能付き
+電子公図データ抽出Webアプリ (Streamlit版) - Web/GitHub参照対応 - 丁目・小字選択機能付き
 """
 
 import streamlit as st
@@ -187,8 +187,8 @@ class KojiWebExtractor:
         coordinates = ET.SubElement(kml_point, "coordinates")
         coordinates.text = f"{point.x},{point.y},0"
     
-    def extract_data(self, gdf, oaza, chome, chiban, range_m):
-        """データ抽出処理（丁目対応）"""
+    def extract_data(self, gdf, oaza, chome, koaza, chiban, range_m):
+        """データ抽出処理（丁目・小字対応）"""
         try:
             # 必要な列の存在確認
             required_columns = ['大字名', '地番']
@@ -208,7 +208,7 @@ class KojiWebExtractor:
                 warning_msg = "警告: NULL値が含まれています - " + ", ".join([f"{k}: {v}件" for k, v in null_check.items()])
                 st.warning(warning_msg)
             
-            # 検索条件を構築（丁目の有無に応じて）
+            # 検索条件を構築（丁目・小字の有無に応じて）
             search_condition = (
                 (gdf['大字名'] == oaza) & 
                 (gdf['地番'] == chiban) &
@@ -219,6 +219,10 @@ class KojiWebExtractor:
             # 丁目が指定されている場合は条件に追加
             if chome is not None and chome != "選択なし" and '丁目名' in gdf.columns:
                 search_condition = search_condition & (gdf['丁目名'] == chome) & (gdf['丁目名'].notna())
+            
+            # 小字が指定されている場合は条件に追加
+            if koaza is not None and koaza != "選択なし" and '小字名' in gdf.columns:
+                search_condition = search_condition & (gdf['小字名'] == koaza) & (gdf['小字名'].notna())
             
             df = gdf[search_condition]
             
@@ -235,12 +239,19 @@ class KojiWebExtractor:
                     chome_matches = gdf[gdf['丁目名'] == chome]['丁目名'].count()
                     debug_info.append(f"丁目名'{chome}'の該当件数: {chome_matches}")
                 
+                if koaza and koaza != "選択なし" and '小字名' in gdf.columns:
+                    koaza_matches = gdf[gdf['小字名'] == koaza]['小字名'].count()
+                    debug_info.append(f"小字名'{koaza}'の該当件数: {koaza_matches}")
+                
                 return None, None, f"該当する筆が見つかりませんでした。{' / '.join(debug_info)}"
             
             # 利用可能な列のみを選択
             available_columns = ["大字名", "地番", "geometry"]
             if "丁目名" in gdf.columns:
                 available_columns.insert(1, "丁目名")
+            if "小字名" in gdf.columns:
+                insert_position = 2 if "丁目名" in available_columns else 1
+                available_columns.insert(insert_position, "小字名")
             
             # 存在する列のみでデータフレームを作成
             existing_columns = [col for col in available_columns if col in df.columns]
@@ -299,6 +310,8 @@ class KojiWebExtractor:
                 overlay_columns.insert(0, '大字名')
             if '丁目名' in valid_data.columns:
                 overlay_columns.insert(-1, '丁目名')
+            if '小字名' in valid_data.columns:
+                overlay_columns.insert(-1, '小字名')
             
             existing_overlay_columns = [col for col in overlay_columns if col in valid_data.columns]
             df2 = gpd.GeoDataFrame(valid_data[existing_overlay_columns])
@@ -308,7 +321,7 @@ class KojiWebExtractor:
             return df_summary, overlay_gdf, f"対象筆: {len(df_summary)}件, 周辺筆: {len(overlay_gdf)}件"
             
         except Exception as e:
-            return None, None, f"エラー: {str(e)}"
+            return None, None, f"エラー: {str(e)}")
 
 def get_chome_options(gdf, selected_oaza):
     """指定された大字名に対応する丁目の選択肢を取得"""
@@ -335,6 +348,38 @@ def get_chome_options(gdf, selected_oaza):
         st.error(f"丁目名取得エラー: {str(e)}")
         return None
 
+def get_koaza_options(gdf, selected_oaza, selected_chome=None):
+    """指定された大字名（及び丁目名）に対応する小字の選択肢を取得"""
+    try:
+        if '小字名' not in gdf.columns:
+            return None
+        
+        # フィルタ条件を構築
+        filter_condition = (
+            (gdf['大字名'] == selected_oaza) & 
+            (gdf['大字名'].notna()) &
+            (gdf['小字名'].notna())
+        )
+        
+        # 丁目が指定されている場合は条件に追加
+        if selected_chome and selected_chome != "選択なし" and '丁目名' in gdf.columns:
+            filter_condition = filter_condition & (gdf['丁目名'] == selected_chome) & (gdf['丁目名'].notna())
+        
+        # 指定された条件でフィルタリング
+        filtered_gdf = gdf[filter_condition]
+        
+        if len(filtered_gdf) == 0:
+            return None
+        
+        # 小字名のユニークな値を取得してソート
+        koaza_list = sorted(filtered_gdf['小字名'].unique())
+        
+        return koaza_list
+        
+    except Exception as e:
+        st.error(f"小字名取得エラー: {str(e)}")
+        return None
+
 def main():
     st.title("🗺️ 電子公図データ抽出ツール")
     st.markdown("---")
@@ -342,13 +387,74 @@ def main():
     extractor = KojiWebExtractor()
     
     # サイドバー
+    st.sidebar.header("📋 プリセットファイル")
+    
+    # プリセットファイル機能
+    preset_files = {
+        "サンプル1": {
+            "name": "東京都サンプル地番データ",
+            "url": "https://example.com/tokyo_sample.zip",
+            "description": "東京都の地番データサンプル（丁目・小字対応）"
+        },
+        "サンプル2": {
+            "name": "大阪府サンプル地番データ", 
+            "url": "https://example.com/osaka_sample.zip",
+            "description": "大阪府の地番データサンプル（小字対応）"
+        },
+        "サンプル3": {
+            "name": "基本地番データ",
+            "url": "https://example.com/basic_sample.zip", 
+            "description": "基本的な地番データ（大字名・地番のみ）"
+        }
+    }
+    
+    # プリセット選択
+    selected_preset = st.sidebar.selectbox(
+        "プリセットファイルを選択",
+        ["選択なし"] + list(preset_files.keys()),
+        help="事前に設定されたサンプルファイルから選択できます"
+    )
+    
+    if selected_preset != "選択なし":
+        preset_info = preset_files[selected_preset]
+        st.sidebar.info(f"**{preset_info['name']}**\n\n{preset_info['description']}")
+        
+        if st.sidebar.button("📋 プリセットファイルを読み込み", type="secondary"):
+            try:
+                with st.spinner(f"プリセット「{selected_preset}」を読み込み中..."):
+                    st.session_state.gdf = extractor.load_shapefile_from_url(preset_info['url'])
+                
+                st.sidebar.success("✅ プリセット読み込み完了!")
+                st.sidebar.info(f"📊 レコード数: {len(st.session_state.gdf):,}件")
+                
+                if st.session_state.gdf.crs:
+                    st.sidebar.info(f"🗺️ 座標系: {st.session_state.gdf.crs}")
+                
+                # 丁目名・小字名列の存在確認
+                if '丁目名' in st.session_state.gdf.columns:
+                    chome_count = st.session_state.gdf['丁目名'].notna().sum()
+                    st.sidebar.info(f"🏘️ 丁目データ: {chome_count}件")
+                
+                if '小字名' in st.session_state.gdf.columns:
+                    koaza_count = st.session_state.gdf['小字名'].notna().sum()
+                    st.sidebar.info(f"🏞️ 小字データ: {koaza_count}件")
+                
+                # データソース情報を記録
+                st.session_state.data_source = "プリセット"
+                st.session_state.current_preset = selected_preset
+                st.session_state.file_info = preset_info['name']
+                    
+            except Exception as e:
+                st.sidebar.error(f"❌ プリセット読み込みエラー: {str(e)}")
+    
+    st.sidebar.markdown("---")
     st.sidebar.header("📂 データソース選択")
     
     # データソース選択
     data_source = st.sidebar.radio(
-        "データソースを選択してください",
+        "独自データソースを選択",
         ["📁 ローカルファイル", "🌐 Web URL", "🐙 GitHub"],
-        help="データの取得方法を選択してください"
+        help="独自のデータファイルを使用する場合の取得方法を選択してください"
     )
     
     if data_source == "📁 ローカルファイル":
@@ -380,14 +486,20 @@ def main():
                         if st.session_state.gdf.crs:
                             st.sidebar.info(f"🗺️ 座標系: {st.session_state.gdf.crs}")
                         
-                        # 丁目名列の存在確認
+                        # 丁目名・小字名列の存在確認
                         if '丁目名' in st.session_state.gdf.columns:
                             chome_count = st.session_state.gdf['丁目名'].notna().sum()
                             st.sidebar.info(f"🏘️ 丁目データ: {chome_count}件")
                         
+                        if '小字名' in st.session_state.gdf.columns:
+                            koaza_count = st.session_state.gdf['小字名'].notna().sum()
+                            st.sidebar.info(f"🏞️ 小字データ: {koaza_count}件")
+                        
                         # データソース情報を記録
                         st.session_state.data_source = "ローカルファイル"
                         st.session_state.file_info = uploaded_file.name
+                        if 'current_preset' in st.session_state:
+                            del st.session_state.current_preset
                     else:
                         st.sidebar.error("❌ SHPファイルが見つかりません")
                         
@@ -414,14 +526,20 @@ def main():
                     if st.session_state.gdf.crs:
                         st.sidebar.info(f"🗺️ 座標系: {st.session_state.gdf.crs}")
                     
-                    # 丁目名列の存在確認
+                    # 丁目名・小字名列の存在確認
                     if '丁目名' in st.session_state.gdf.columns:
                         chome_count = st.session_state.gdf['丁目名'].notna().sum()
                         st.sidebar.info(f"🏘️ 丁目データ: {chome_count}件")
                     
+                    if '小字名' in st.session_state.gdf.columns:
+                        koaza_count = st.session_state.gdf['小字名'].notna().sum()
+                        st.sidebar.info(f"🏞️ 小字データ: {koaza_count}件")
+                    
                     # データソース情報を記録
                     st.session_state.data_source = "Web URL"
                     st.session_state.file_info = web_url
+                    if 'current_preset' in st.session_state:
+                        del st.session_state.current_preset
                         
                 except Exception as e:
                     st.sidebar.error(f"❌ {str(e)}")
@@ -458,24 +576,25 @@ def main():
                     if st.session_state.gdf.crs:
                         st.sidebar.info(f"🗺️ 座標系: {st.session_state.gdf.crs}")
                     
-                    # 丁目名列の存在確認
+                    # 丁目名・小字名列の存在確認
                     if '丁目名' in st.session_state.gdf.columns:
                         chome_count = st.session_state.gdf['丁目名'].notna().sum()
                         st.sidebar.info(f"🏘️ 丁目データ: {chome_count}件")
                     
+                    if '小字名' in st.session_state.gdf.columns:
+                        koaza_count = st.session_state.gdf['小字名'].notna().sum()
+                        st.sidebar.info(f"🏞️ 小字データ: {koaza_count}件")
+                    
                     # データソース情報を記録
                     st.session_state.data_source = "GitHub"
                     st.session_state.file_info = github_url
+                    if 'current_preset' in st.session_state:
+                        del st.session_state.current_preset
                         
                 except Exception as e:
                     st.sidebar.error(f"❌ {str(e)}")
             else:
                 st.sidebar.error("GitHubの情報をすべて入力してください")
-    
-    # プリセットファイル機能（前のコードと同じなので省略）
-    with st.sidebar.expander("📋 プリセットファイル"):
-        # プリセット機能の実装...（省略）
-        pass
     
     # メインエリア
     if st.session_state.gdf is not None:
@@ -530,6 +649,35 @@ def main():
                     # 丁目名列自体が存在しない
                     st.info("ℹ️ このデータセットには丁目情報が含まれていません")
             
+            # 小字名選択（大字名が選択されている場合のみ）
+            selected_koaza = None
+            if selected_oaza is not None:
+                koaza_options = get_koaza_options(st.session_state.gdf, selected_oaza, selected_chome)
+                
+                if koaza_options is not None and len(koaza_options) > 0:
+                    # 小字選択肢がある場合
+                    koaza_list_with_none = ["選択なし"] + koaza_options
+                    selected_koaza = st.selectbox(
+                        "小字名を選択（任意）", 
+                        koaza_list_with_none,
+                        help="小字を指定する場合は選択してください。指定しない場合は「選択なし」のままにしてください。"
+                    )
+                    
+                    if selected_koaza == "選択なし":
+                        st.info("💡 小字を指定せずに検索します")
+                    else:
+                        st.success(f"✅ 小字「{selected_koaza}」を指定しました")
+                        
+                elif '小字名' in st.session_state.gdf.columns:
+                    # 小字名列は存在するが、この大字名（丁目名）には小字データがない
+                    condition_text = f"大字名「{selected_oaza}」"
+                    if selected_chome and selected_chome != "選択なし":
+                        condition_text += f"・丁目名「{selected_chome}」"
+                    st.info(f"ℹ️ {condition_text}には小字データがありません")
+                else:
+                    # 小字名列自体が存在しない
+                    st.info("ℹ️ このデータセットには小字情報が含まれていません")
+            
             # 地番入力
             chiban = st.text_input("地番を入力", value="1174")
             
@@ -549,7 +697,7 @@ def main():
                     else:
                         with st.spinner("データ抽出中..."):
                             target_gdf, overlay_gdf, message = extractor.extract_data(
-                                st.session_state.gdf, selected_oaza, selected_chome, chiban, range_m
+                                st.session_state.gdf, selected_oaza, selected_chome, selected_koaza, chiban, range_m
                             )
                         
                         st.info(message)
@@ -559,11 +707,15 @@ def main():
                             st.session_state.target_gdf = target_gdf
                             st.session_state.overlay_gdf = overlay_gdf
                             
-                            # ファイル名の生成（丁目が指定されている場合は含める）
+                            # ファイル名の生成（丁目・小字が指定されている場合は含める）
+                            file_name_parts = [selected_oaza]
                             if selected_chome and selected_chome != "選択なし":
-                                st.session_state.file_name = f"{selected_oaza}_{selected_chome}_{chiban}"
-                            else:
-                                st.session_state.file_name = f"{selected_oaza}_{chiban}"
+                                file_name_parts.append(selected_chome)
+                            if selected_koaza and selected_koaza != "選択なし":
+                                file_name_parts.append(selected_koaza)
+                            file_name_parts.append(chiban)
+                            
+                            st.session_state.file_name = "_".join(file_name_parts)
                 elif not selected_oaza:
                     st.error("大字名を選択してください")
                 else:
@@ -587,14 +739,19 @@ def main():
                         if st.session_state.gdf.crs:
                             st.write(f"**座標系**: {st.session_state.gdf.crs}")
                         
-                        # 丁目データの有無を表示
+                        # 丁目・小字データの有無を表示
                         if '丁目名' in st.session_state.gdf.columns:
                             chome_count = st.session_state.gdf['丁目名'].notna().sum()
                             total_count = len(st.session_state.gdf)
                             st.write(f"**丁目データ**: {chome_count}/{total_count}件 ({chome_count/total_count*100:.1f}%)")
+                        
+                        if '小字名' in st.session_state.gdf.columns:
+                            koaza_count = st.session_state.gdf['小字名'].notna().sum()
+                            total_count = len(st.session_state.gdf)
+                            st.write(f"**小字データ**: {koaza_count}/{total_count}件 ({koaza_count/total_count*100:.1f}%)")
             
-            # 大字名と丁目名のサマリー
-            if st.checkbox("大字名・丁目名一覧を表示"):
+            # 大字名・丁目名・小字名のサマリー
+            if st.checkbox("大字名・丁目名・小字名一覧を表示"):
                 try:
                     if '大字名' in st.session_state.gdf.columns:
                         # NULL値を除外して集計
@@ -611,27 +768,45 @@ def main():
                                     st.write("**丁目名別集計:**")
                                     chome_summary = chome_clean.value_counts()
                                     st.dataframe(chome_summary.head(20), use_container_width=True)
-                                    
-                                    # 大字名×丁目名のクロス集計
-                                    if len(chome_clean) > 0:
-                                        st.write("**大字名×丁目名の組み合わせ:**")
-                                        cross_data = st.session_state.gdf[
-                                            (st.session_state.gdf['大字名'].notna()) & 
-                                            (st.session_state.gdf['丁目名'].notna())
-                                        ]
-                                        if len(cross_data) > 0:
-                                            cross_summary = cross_data.groupby(['大字名', '丁目名']).size().reset_index(name='件数')
-                                            st.dataframe(cross_summary.head(20), use_container_width=True)
+                            
+                            # 小字名の集計も表示
+                            if '小字名' in st.session_state.gdf.columns:
+                                koaza_clean = st.session_state.gdf['小字名'].dropna()
+                                if len(koaza_clean) > 0:
+                                    st.write("**小字名別集計:**")
+                                    koaza_summary = koaza_clean.value_counts()
+                                    st.dataframe(koaza_summary.head(20), use_container_width=True)
+                            
+                            # 大字名×丁目名×小字名のクロス集計
+                            cross_columns = ['大字名']
+                            if '丁目名' in st.session_state.gdf.columns:
+                                cross_columns.append('丁目名')
+                            if '小字名' in st.session_state.gdf.columns:
+                                cross_columns.append('小字名')
+                            
+                            if len(cross_columns) > 1:
+                                st.write(f"**{' × '.join(cross_columns)}の組み合わせ:**")
+                                cross_data = st.session_state.gdf.copy()
+                                
+                                # 各列がNULLでないデータのみ抽出
+                                for col in cross_columns:
+                                    cross_data = cross_data[cross_data[col].notna()]
+                                
+                                if len(cross_data) > 0:
+                                    cross_summary = cross_data.groupby(cross_columns).size().reset_index(name='件数')
+                                    cross_summary = cross_summary.sort_values('件数', ascending=False)
+                                    st.dataframe(cross_summary.head(20), use_container_width=True)
                             
                             # NULL値の情報も表示
-                            null_count = st.session_state.gdf['大字名'].isnull().sum()
-                            if null_count > 0:
-                                st.warning(f"⚠️ 大字名のNULL値が{null_count}件あります")
+                            null_info = []
+                            for col in ['大字名', '丁目名', '小字名']:
+                                if col in st.session_state.gdf.columns:
+                                    null_count = st.session_state.gdf[col].isnull().sum()
+                                    if null_count > 0:
+                                        null_info.append(f"{col}: {null_count}件")
                             
-                            if '丁目名' in st.session_state.gdf.columns:
-                                chome_null_count = st.session_state.gdf['丁目名'].isnull().sum()
-                                if chome_null_count > 0:
-                                    st.info(f"ℹ️ 丁目名のNULL値が{chome_null_count}件あります（丁目データがない地域）")
+                            if null_info:
+                                st.warning(f"⚠️ NULL値: {', '.join(null_info)}")
                         else:
                             st.error("大字名データがすべてNULLまたは空です")
                     else:
@@ -673,7 +848,7 @@ def main():
                             
                             # 表示用の列を選択
                             display_columns = []
-                            for col in ['大字名', '丁目名', '地番']:
+                            for col in ['大字名', '丁目名', '小字名', '地番']:
                                 if col in filtered.columns:
                                     display_columns.append(col)
                             
@@ -739,6 +914,10 @@ def main():
                     if '丁目名' in st.session_state.gdf.columns:
                         stats_info['丁目名の種類数'] = st.session_state.gdf['丁目名'].nunique()
                         stats_info['丁目データ有り'] = st.session_state.gdf['丁目名'].notna().sum()
+                    
+                    if '小字名' in st.session_state.gdf.columns:
+                        stats_info['小字名の種類数'] = st.session_state.gdf['小字名'].nunique()
+                        stats_info['小字データ有り'] = st.session_state.gdf['小字名'].notna().sum()
                     
                     for key, value in stats_info.items():
                         st.write(f"- **{key}**: {value}")
@@ -830,7 +1009,7 @@ def main():
                     if st.checkbox("周辺筆の統計情報を表示"):
                         st.write("**周辺筆の統計:**")
                         stats_cols = []
-                        for col in ['大字名', '丁目名', '地番']:
+                        for col in ['大字名', '丁目名', '小字名', '地番']:
                             if col in st.session_state.overlay_gdf.columns:
                                 stats_cols.append(col)
                         
@@ -857,6 +1036,11 @@ def main():
                     search_conditions['丁目名'] = selected_chome
                 else:
                     search_conditions['丁目名'] = '指定なし'
+                
+                if 'selected_koaza' in locals() and selected_koaza and selected_koaza != "選択なし":
+                    search_conditions['小字名'] = selected_koaza
+                else:
+                    search_conditions['小字名'] = '指定なし'
                 
                 for key, value in search_conditions.items():
                     st.write(f"- **{key}**: {value}")
@@ -895,15 +1079,18 @@ def main():
             2. **大字名**をドロップダウンから選択
             3. **丁目名**を選択（丁目データがある場合のみ表示）
                - 丁目を指定したくない場合は「選択なし」のまま
-            4. **地番**を入力
-            5. **検索範囲**を設定（デフォルト: 61m）
-            6. **データ抽出**ボタンをクリック
-            7. **KMLファイル**をダウンロード
+            4. **小字名**を選択（小字データがある場合のみ表示）
+               - 小字を指定したくない場合は「選択なし」のまま
+            5. **地番**を入力
+            6. **検索範囲**を設定（デフォルト: 61m）
+            7. **データ抽出**ボタンをクリック
+            8. **KMLファイル**をダウンロード
             
-            ### 🏘️ 丁目機能について
-            - データに「丁目名」列が含まれている場合、丁目での絞り込みが可能
-            - 大字名を選択すると、その大字に対応する丁目のみが表示されます
-            - 丁目を指定しない場合は、大字名内の全ての筆が検索対象になります
+            ### 🏘️ 丁目・小字機能について
+            - データに「丁目名」「小字名」列が含まれている場合、それぞれでの絞り込みが可能
+            - 大字名を選択すると、その大字に対応する丁目・小字のみが表示されます
+            - 丁目を選択すると、その丁目に対応する小字のみが表示されます
+            - 丁目・小字を指定しない場合は、上位の地域区分内の全ての筆が検索対象になります
             
             ### 🎯 出力ファイル
             - **対象筆KML**: 指定した筆のKMLファイル
@@ -920,11 +1107,20 @@ def main():
             - **地番検索**: 完全一致・部分一致での地番検索
             - **座標表示**: 検索結果に中心座標を表示可能
             - **データ構造確認**: 列情報、NULL値統計、サンプルデータの確認
+            - **階層検索**: 大字名→丁目名→小字名の階層での絞り込み検索
             
             ### 🔗 URL形式の例
             - **直接URL**: `https://example.com/shapefile.zip`
             - **GitHub**: `https://github.com/username/repo/blob/main/data.zip`
             - **GitHub Raw**: `https://raw.githubusercontent.com/username/repo/main/data.zip`
+            
+            ### 📍 地域区分の階層
+            ```
+            大字名 (必須)
+            ├── 丁目名 (任意)
+            │   └── 小字名 (任意)
+            └── 小字名 (任意、丁目なしの場合)
+            ```
             """)
 
 if __name__ == "__main__":
