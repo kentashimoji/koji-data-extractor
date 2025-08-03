@@ -648,7 +648,7 @@ def main():
     
     # デフォルトのWebフォルダURL（例）
     default_folder_urls = [
-        "https://github.com/kentashimoji/koji-data-extractor/tree/c8b2fc8d8968a1e56077ff18ed4757416764c337/47okinawa"
+        "https://github.com/kentashimoji/koji-data-extractor/tree/549107659362957e65bb3183f7831c3d1c259cc8/47okinawa"
     ]
     
     # カスタムフォルダURL入力
