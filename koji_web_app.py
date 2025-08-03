@@ -190,14 +190,27 @@ class KojiWebExtractor:
     def extract_data(self, gdf, oaza, chiban, range_m):
         """データ抽出処理"""
         try:
+            # 必要な列の存在確認
+            required_columns = ['大字名', '地番']
+            missing_columns = [col for col in required_columns if col not in gdf.columns]
+            
+            if missing_columns:
+                return None, None, f"必要な列が見つかりません: {missing_columns}"
+            
             # 指定した筆を検索
             df = gdf[(gdf['大字名'] == oaza) & (gdf['地番'] == chiban)]
             
             if df.empty:
                 return None, None, "該当する筆が見つかりませんでした"
             
-            # 不要な列を削除
-            df_summary = df.reindex(columns=["大字名", "丁目名", "地番", "geometry"])
+            # 利用可能な列のみを選択
+            available_columns = ["大字名", "地番", "geometry"]
+            if "丁目名" in gdf.columns:
+                available_columns.insert(1, "丁目名")
+            
+            # 存在する列のみでデータフレームを作成
+            existing_columns = [col for col in available_columns if col in df.columns]
+            df_summary = df.reindex(columns=existing_columns)
             
             # 中心点計算と周辺筆抽出
             cen = df_summary.centroid
@@ -372,9 +385,9 @@ def main():
         
         # プリセット設定（実際の使用時は設定ファイルやデータベースから読み込み）
         presets = {
-            "🏙那覇市": {
-                "url": "https://github.com/kentashimoji/koji-data-extractor/blob/e7ac0c0fe91124e4345e9a26ca938f489ef12052/47okinawa/47201_%E9%82%A3%E8%A6%87%E5%B8%82_%E5%85%AC%E5%85%B1%E5%BA%A7%E6%A8%9915%E7%B3%BB_%E7%AD%86R_2025.zip",
-                "description": "那覇市"
+            "🏙️ 東京都市部サンプル": {
+                "url": "https://raw.githubusercontent.com/example/tokyo-data/main/tokyo_sample.zip",
+                "description": "東京都心部の公図データサンプル"
             },
             "🌾 農村部サンプル": {
                 "url": "https://raw.githubusercontent.com/example/rural-data/main/rural_sample.zip", 
@@ -523,9 +536,18 @@ def main():
         with col1:
             st.header("🔍 検索条件")
             
-            # 大字名選択
-            oaza_list = sorted(st.session_state.gdf['大字名'].unique())
-            selected_oaza = st.selectbox("大字名を選択", oaza_list)
+            # 大字名選択（データが存在する場合のみ）
+            try:
+                if '大字名' in st.session_state.gdf.columns:
+                    oaza_list = sorted(st.session_state.gdf['大字名'].unique())
+                    selected_oaza = st.selectbox("大字名を選択", oaza_list)
+                else:
+                    st.error("❌ '大字名'列が見つかりません。データの形式を確認してください。")
+                    st.write("**利用可能な列:**", list(st.session_state.gdf.columns))
+                    selected_oaza = None
+            except Exception as e:
+                st.error(f"❌ データ読み込みエラー: {str(e)}")
+                selected_oaza = None
             
             # 地番入力
             chiban = st.text_input("地番を入力", value="1174")
@@ -536,20 +558,30 @@ def main():
             # 抽出ボタン
             if st.button("🚀 データ抽出", type="primary", use_container_width=True):
                 if selected_oaza and chiban:
-                    with st.spinner("データ抽出中..."):
-                        target_gdf, overlay_gdf, message = extractor.extract_data(
-                            st.session_state.gdf, selected_oaza, chiban, range_m
-                        )
+                    # 必要な列が存在するかチェック
+                    required_columns = ['大字名', '地番']
+                    missing_columns = [col for col in required_columns if col not in st.session_state.gdf.columns]
                     
-                    st.info(message)
-                    
-                    if target_gdf is not None and overlay_gdf is not None:
-                        # 結果を保存
-                        st.session_state.target_gdf = target_gdf
-                        st.session_state.overlay_gdf = overlay_gdf
-                        st.session_state.file_name = f"{selected_oaza}{chiban}"
+                    if missing_columns:
+                        st.error(f"❌ 必要な列が見つかりません: {missing_columns}")
+                        st.write("**利用可能な列:**", list(st.session_state.gdf.columns))
+                    else:
+                        with st.spinner("データ抽出中..."):
+                            target_gdf, overlay_gdf, message = extractor.extract_data(
+                                st.session_state.gdf, selected_oaza, chiban, range_m
+                            )
+                        
+                        st.info(message)
+                        
+                        if target_gdf is not None and overlay_gdf is not None:
+                            # 結果を保存
+                            st.session_state.target_gdf = target_gdf
+                            st.session_state.overlay_gdf = overlay_gdf
+                            st.session_state.file_name = f"{selected_oaza}{chiban}"
+                elif not selected_oaza:
+                    st.error("大字名を選択してください")
                 else:
-                    st.error("大字名と地番を入力してください")
+                    st.error("地番を入力してください")
         
         with col2:
             st.header("📊 データ一覧")
@@ -571,20 +603,62 @@ def main():
             
             # 大字名のサマリー
             if st.checkbox("大字名一覧を表示"):
-                oaza_summary = st.session_state.gdf['大字名'].value_counts()
-                st.dataframe(oaza_summary.head(20), use_container_width=True)
+                try:
+                    if '大字名' in st.session_state.gdf.columns:
+                        oaza_summary = st.session_state.gdf['大字名'].value_counts()
+                        st.dataframe(oaza_summary.head(20), use_container_width=True)
+                    else:
+                        st.warning("'大字名'列が見つかりません")
+                except Exception as e:
+                    st.error(f"データ表示エラー: {str(e)}")
             
             # 地番検索
             if st.checkbox("地番検索"):
                 search_term = st.text_input("地番を検索", placeholder="例: 1174")
                 if search_term:
-                    filtered = st.session_state.gdf[
-                        st.session_state.gdf['地番'].astype(str).str.contains(search_term, na=False)
-                    ]
-                    st.dataframe(
-                        filtered[['大字名', '地番']].head(20),
-                        use_container_width=True
-                    )
+                    try:
+                        if '地番' in st.session_state.gdf.columns:
+                            filtered = st.session_state.gdf[
+                                st.session_state.gdf['地番'].astype(str).str.contains(search_term, na=False)
+                            ]
+                            
+                            # 表示用の列を選択
+                            display_columns = []
+                            for col in ['大字名', '丁目名', '地番']:
+                                if col in filtered.columns:
+                                    display_columns.append(col)
+                            
+                            if display_columns:
+                                st.dataframe(
+                                    filtered[display_columns].head(20),
+                                    use_container_width=True
+                                )
+                            else:
+                                st.warning("表示可能な列が見つかりません")
+                        else:
+                            st.warning("'地番'列が見つかりません")
+                    except Exception as e:
+                        st.error(f"検索エラー: {str(e)}")
+            
+            # データ構造の確認
+            if st.checkbox("📋 データ構造を確認"):
+                try:
+                    st.write("**カラム一覧:**")
+                    col_info = pd.DataFrame({
+                        'カラム名': st.session_state.gdf.columns,
+                        'データ型': st.session_state.gdf.dtypes.astype(str),
+                        '非NULL数': st.session_state.gdf.count()
+                    })
+                    st.dataframe(col_info, use_container_width=True)
+                    
+                    st.write("**データサンプル (最初の5行):**")
+                    display_df = st.session_state.gdf.head()
+                    if 'geometry' in display_df.columns:
+                        display_df = display_df.drop(columns=['geometry'])
+                    st.dataframe(display_df, use_container_width=True)
+                    
+                except Exception as e:
+                    st.error(f"データ構造確認エラー: {str(e)}")
         
         # 結果表示とダウンロード
         if 'target_gdf' in st.session_state and 'overlay_gdf' in st.session_state:
