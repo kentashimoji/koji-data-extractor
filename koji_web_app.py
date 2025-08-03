@@ -575,7 +575,7 @@ class KojiWebExtractor:
             return df_summary, overlay_gdf, f"対象筆: {len(df_summary)}件, 周辺筆: {len(overlay_gdf)}件"
             
         except Exception as e:
-            return None, None, f"エラー: {str(e)}")
+            return None, None, f"エラー: {str(e)}"
 
 def get_chome_options(gdf, selected_oaza):
     """指定された大字名に対応する丁目の選択肢を取得"""
