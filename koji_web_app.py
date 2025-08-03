@@ -56,7 +56,7 @@ class KojiWebExtractor:
             return []
     
     def _get_github_folder_files(self, folder_url, file_extensions):
-        """GitHubフォルダからファイル一覧を取得（GitHub API使用）"""
+        """GitHubフォルダからファイル一覧を取得（GitHub API使用 + レート制限対策）"""
         try:
             # GitHub URLを解析
             # https://github.com/user/repo/tree/branch/path -> GitHub API URL
@@ -75,42 +75,159 @@ class KojiWebExtractor:
                 branch = 'main'
                 path = '/'.join(parts[2:]) if len(parts) > 2 else ''
             
-            # GitHub API URL構築
-            api_url = f"https://api.github.com/repos/{user}/{repo}/contents/{path}"
-            if branch != 'main':
-                api_url += f"?ref={branch}"
-            
-            response = requests.get(api_url, timeout=30)
-            response.raise_for_status()
-            
-            files_data = response.json()
-            files = []
-            
-            for item in files_data:
-                if item['type'] == 'file':
-                    file_name = item['name']
-                    if any(file_name.lower().endswith(ext.lower()) for ext in file_extensions):
-                        # rawファイルURLを生成
-                        raw_url = item['download_url']
-                        files.append({
-                            'name': file_name,
-                            'url': raw_url,
-                            'size': item.get('size', 0),
-                            'description': f"GitHubファイル ({item.get('size', 0)} bytes)"
-                        })
-            
-            # キャッシュに保存
-            cache_key = f"{folder_url}_{','.join(file_extensions)}"
-            st.session_state.web_files_cache[cache_key] = files
-            
-            return files
-            
+            # まずAPIを試行し、失敗した場合はraw.githubusercontent.comを使用
+            try:
+                # GitHub API URL構築
+                api_url = f"https://api.github.com/repos/{user}/{repo}/contents/{path}"
+                if branch != 'main':
+                    api_url += f"?ref={branch}"
+                
+                # GitHub APIトークンがある場合は使用（環境変数から取得）
+                headers = {}
+                github_token = os.environ.get('GITHUB_TOKEN')
+                if github_token:
+                    headers['Authorization'] = f'token {github_token}'
+                
+                response = requests.get(api_url, headers=headers, timeout=30)
+                
+                if response.status_code == 403:
+                    # レート制限の場合、代替方法を使用
+                    st.warning("⚠️ GitHub APIのレート制限に達しました。代替方法でファイルを取得します...")
+                    return self._get_github_files_alternative(user, repo, branch, path, file_extensions)
+                
+                response.raise_for_status()
+                
+                files_data = response.json()
+                files = []
+                
+                for item in files_data:
+                    if item['type'] == 'file':
+                        file_name = item['name']
+                        if any(file_name.lower().endswith(ext.lower()) for ext in file_extensions):
+                            # rawファイルURLを生成
+                            raw_url = item['download_url']
+                            files.append({
+                                'name': file_name,
+                                'url': raw_url,
+                                'size': item.get('size', 0),
+                                'description': f"GitHubファイル ({item.get('size', 0)} bytes)"
+                            })
+                
+                # キャッシュに保存
+                cache_key = f"{folder_url}_{','.join(file_extensions)}"
+                st.session_state.web_files_cache[cache_key] = files
+                
+                return files
+                
+            except requests.exceptions.RequestException as e:
+                if "403" in str(e) or "rate limit" in str(e).lower():
+                    # APIレート制限の場合、代替方法を使用
+                    st.warning("⚠️ GitHub APIのレート制限に達しました。代替方法でファイルを取得します...")
+                    return self._get_github_files_alternative(user, repo, branch, path, file_extensions)
+                else:
+                    raise e
+                
         except requests.exceptions.RequestException as e:
             raise Exception(f"GitHub APIアクセスエラー: {str(e)}")
         except json.JSONDecodeError:
             raise Exception("GitHub APIレスポンスの解析に失敗しました")
         except Exception as e:
             raise Exception(f"GitHubフォルダ処理エラー: {str(e)}")
+    
+    def _get_github_files_alternative(self, user, repo, branch, path, file_extensions):
+        """GitHub APIが使えない場合の代替方法（HTMLスクレイピング）"""
+        try:
+            # GitHub Webページから情報を取得
+            web_url = f"https://github.com/{user}/{repo}/tree/{branch}/{path}"
+            
+            response = requests.get(web_url, timeout=30)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            files = []
+            
+            # GitHubのファイルリンクを検索
+            # 新しいGitHubUIに対応したセレクタ
+            file_links = soup.find_all('a', {'class': lambda x: x and 'Link--primary' in x}) if soup.find_all('a', {'class': lambda x: x and 'Link--primary' in x}) else soup.find_all('a', href=True)
+            
+            for link in file_links:
+                href = link.get('href', '')
+                link_text = link.get_text().strip()
+                
+                # ファイルのリンクかチェック
+                if '/blob/' in href and any(link_text.lower().endswith(ext.lower()) for ext in file_extensions):
+                    # raw URLに変換
+                    raw_url = href.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
+                    if not raw_url.startswith('http'):
+                        raw_url = f"https://raw.githubusercontent.com{raw_url}"
+                    
+                    files.append({
+                        'name': link_text,
+                        'url': raw_url,
+                        'size': None,
+                        'description': f"GitHubファイル（代替取得）"
+                    })
+            
+            # さらに代替方法：data-testid属性を使用
+            if not files:
+                file_rows = soup.find_all('div', {'data-testid': lambda x: x and 'file-row' in x}) if soup.find_all('div', {'data-testid': lambda x: x and 'file-row' in x}) else []
+                
+                for row in file_rows:
+                    link = row.find('a', href=True)
+                    if link:
+                        href = link.get('href', '')
+                        link_text = link.get_text().strip()
+                        
+                        if '/blob/' in href and any(link_text.lower().endswith(ext.lower()) for ext in file_extensions):
+                            raw_url = f"https://raw.githubusercontent.com{href.replace('/blob/', '/')}"
+                            
+                            files.append({
+                                'name': link_text,
+                                'url': raw_url,
+                                'size': None,
+                                'description': f"GitHubファイル（代替取得）"
+                            })
+            
+            # それでも見つからない場合、より汎用的な検索
+            if not files:
+                all_links = soup.find_all('a', href=True)
+                for link in all_links:
+                    href = link.get('href', '')
+                    link_text = link.get_text().strip()
+                    
+                    if ('/blob/' in href and 
+                        any(ext.lower() in href.lower() or ext.lower() in link_text.lower() for ext in file_extensions)):
+                        
+                        if href.startswith('/'):
+                            raw_url = f"https://raw.githubusercontent.com{href.replace('/blob/', '/')}"
+                        else:
+                            raw_url = href.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
+                        
+                        file_name = link_text if link_text else os.path.basename(href)
+                        
+                        files.append({
+                            'name': file_name,
+                            'url': raw_url,
+                            'size': None,
+                            'description': f"GitHubファイル（代替取得）"
+                        })
+            
+            # 重複除去
+            seen_names = set()
+            unique_files = []
+            for file_info in files:
+                if file_info['name'] not in seen_names:
+                    seen_names.add(file_info['name'])
+                    unique_files.append(file_info)
+            
+            # キャッシュに保存
+            cache_key = f"{web_url}_{','.join(file_extensions)}"
+            st.session_state.web_files_cache[cache_key] = unique_files
+            
+            return unique_files
+            
+        except Exception as e:
+            raise Exception(f"GitHub代替取得エラー: {str(e)}")
     
     def _get_generic_web_folder_files(self, folder_url, file_extensions):
         """一般的なWebフォルダからファイル一覧を取得（HTMLパース）"""
@@ -458,7 +575,7 @@ class KojiWebExtractor:
             return df_summary, overlay_gdf, f"対象筆: {len(df_summary)}件, 周辺筆: {len(overlay_gdf)}件"
             
         except Exception as e:
-            return None, None, f"エラー: {str(e)}"
+            return None, None, f"エラー: {str(e)}")
 
 def get_chome_options(gdf, selected_oaza):
     """指定された大字名に対応する丁目の選択肢を取得"""
@@ -531,7 +648,9 @@ def main():
     
     # デフォルトのWebフォルダURL（例）
     default_folder_urls = [
-        "https://github.com/kentashimoji/koji-data-extractor/tree/fbe64988f7a49a153e549488b5d3e41689d8211b/47okinawa"
+        "https://github.com/example/geodata/tree/main/shapefiles",
+        "https://data.example.com/shapefiles/",
+        "https://github.com/your-org/survey-data/tree/main/data"
     ]
     
     # カスタムフォルダURL入力
@@ -561,7 +680,15 @@ def main():
     if folder_url:
         if st.sidebar.button("📂 フォルダからファイル一覧を取得", type="secondary"):
             with st.spinner("Webフォルダからファイル一覧を取得中..."):
-                web_files = extractor.get_files_from_web_folder(folder_url)
+                try:
+                    web_files = extractor.get_files_from_web_folder(folder_url)
+                except Exception as e:
+                    if "rate limit" in str(e).lower() or "403" in str(e):
+                        st.sidebar.error("❌ GitHub APIのレート制限に達しました。しばらく待ってから再試行してください。")
+                        st.sidebar.info("💡 ヒント: GitHubトークンを環境変数 'GITHUB_TOKEN' に設定すると制限が緩和されます。")
+                    else:
+                        st.sidebar.error(f"❌ エラー: {str(e)}")
+                    web_files = []
             
             if web_files:
                 st.sidebar.success(f"✅ {len(web_files)}個のファイルが見つかりました")
@@ -1420,6 +1547,17 @@ def main():
             - **バージョン管理**: GitHubを使用した場合、ファイルのバージョン管理が可能
             - **共有**: チーム内でのデータ共有が容易
             - **自動発見**: 対応拡張子のファイルを自動検出
+            
+            ### ⚠️ GitHub API制限について
+            - **レート制限**: GitHub APIは1時間あたり60リクエストの制限があります
+            - **制限時の対処**: 制限に達した場合、自動的に代替方法（HTMLスクレイピング）に切り替わります
+            - **トークン使用**: GitHubトークンを環境変数`GITHUB_TOKEN`に設定すると制限が緩和されます（5000リクエスト/時間）
+            - **待機時間**: 制限に達した場合、1時間待ってから再試行してください
+            
+            ### 🔧 トラブルシューティング
+            - **403エラー**: GitHub APIレート制限の可能性があります。時間をおいて再試行してください
+            - **ファイルが見つからない**: フォルダのURLが正しいか、ファイルが.zipまたは.shp形式か確認してください
+            - **認証エラー**: プライベートリポジトリの場合、適切なアクセス権限が必要です
             """)
 
 if __name__ == "__main__":
