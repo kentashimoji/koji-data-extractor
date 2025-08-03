@@ -421,9 +421,9 @@ def main():
         
         # プリセット設定（実際の使用時は設定ファイルやデータベースから読み込み）
         presets = {
-            "🏙️ 東京都市部サンプル": {
-                "url": "https://raw.githubusercontent.com/example/tokyo-data/main/tokyo_sample.zip",
-                "description": "東京都心部の公図データサンプル"
+            "那覇市": {
+                "url": "https://github.com/kentashimoji/koji-data-extractor/blob/ca3935d6a5b06624b385ea46caa772f519157e29/47okinawa/47201_%E9%82%A3%E8%A6%87%E5%B8%82_%E5%85%AC%E5%85%B1%E5%BA%A7%E6%A8%9915%E7%B3%BB_%E7%AD%86R_2025.zip",
+                "description": "那覇市"
             },
             "🌾 農村部サンプル": {
                 "url": "https://raw.githubusercontent.com/example/rural-data/main/rural_sample.zip", 
