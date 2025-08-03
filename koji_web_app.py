@@ -534,6 +534,7 @@ def main():
         "https://github.com/example/geodata/tree/main/shapefiles",
         "https://data.example.com/shapefiles/",
         "https://github.com/your-org/survey-data/tree/main/data"
+        "47okinawa"
     ]
     
     # カスタムフォルダURL入力
