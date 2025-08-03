@@ -648,9 +648,7 @@ def main():
     
     # デフォルトのWebフォルダURL（例）
     default_folder_urls = [
-        "https://github.com/example/geodata/tree/main/shapefiles",
-        "https://data.example.com/shapefiles/",
-        "https://github.com/your-org/survey-data/tree/main/data"
+        "https://github.com/kentashimoji/koji-data-extractor/tree/c8b2fc8d8968a1e56077ff18ed4757416764c337/47okinawa"
     ]
     
     # カスタムフォルダURL入力
