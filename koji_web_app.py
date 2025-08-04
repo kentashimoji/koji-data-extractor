@@ -1,28 +1,848 @@
-    # 検索結果からファイル選択
-    if 'matching_files' in st.session_state and st.session_state.matching_files:
-        st.sidebar.write(f"**🎯 {st.session_state.selected_municipality}の対象ファイル:**")
+# -*- coding: utf-8 -*-
+"""
+電子公図データ抽出Webアプリ (Streamlit版) - Web/GitHub参照対応 - 丁目・小字選択機能付き - Webフォルダ対応
+"""
+
+import streamlit as st
+import geopandas as gpd
+import pandas as pd
+from shapely.geometry import Point, Polygon, MultiPolygon
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
+import zipfile
+import io
+import tempfile
+import os
+import requests
+from urllib.parse import urlparse, urljoin, urlunparse
+import re
+from bs4 import BeautifulSoup
+import json
+
+# ページ設定
+st.set_page_config(
+    page_title="電子公図データ抽出ツール",
+    page_icon="🗺️",
+    layout="wide"
+)
+
+class KojiWebExtractor:
+    def __init__(self):
+        if 'gdf' not in st.session_state:
+            st.session_state.gdf = None
+        if 'web_files_cache' not in st.session_state:
+            st.session_state.web_files_cache = {}
+    
+    def get_files_from_web_folder(self, folder_url, file_extensions=None):
+        """Web上のフォルダからファイル一覧を取得"""
+        if file_extensions is None:
+            file_extensions = ['.zip', '.shp']
         
-        file_options = ["選択してください"] + [f["name"] for f in st.session_state.matching_files]
-        selected_file = st.sidebar.selectbox(
-            "ファイルを選択",
-            file_options,
-            help="読み込むShapefileを選択してください"
+        try:
+            # キャッシュをチェック
+            cache_key = f"{folder_url}_{','.join(file_extensions)}"
+            if cache_key in st.session_state.web_files_cache:
+                return st.session_state.web_files_cache[cache_key]
+            
+            # GitHubのフォルダの場合
+            if 'github.com' in folder_url:
+                return self._get_github_folder_files(folder_url, file_extensions)
+            
+            # 通常のWebフォルダの場合
+            return self._get_generic_web_folder_files(folder_url, file_extensions)
+            
+        except Exception as e:
+            st.error(f"フォルダからのファイル取得に失敗しました: {str(e)}")
+            return []
+    
+    def _get_github_folder_files(self, folder_url, file_extensions):
+        """GitHubフォルダからファイル一覧を取得（GitHub API使用 + レート制限対策）"""
+        try:
+            # GitHub URLを解析
+            # https://github.com/user/repo/tree/branch/path -> GitHub API URL
+            parts = folder_url.replace('https://github.com/', '').split('/')
+            if len(parts) < 2:
+                raise Exception("無効なGitHub URLです")
+            
+            user = parts[0]
+            repo = parts[1]
+            
+            # ブランチとパスを特定
+            if len(parts) > 3 and parts[2] == 'tree':
+                branch = parts[3]
+                path = '/'.join(parts[4:]) if len(parts) > 4 else ''
+            else:
+                branch = 'main'
+                path = '/'.join(parts[2:]) if len(parts) > 2 else ''
+            
+            # まずAPIを試行し、失敗した場合はraw.githubusercontent.comを使用
+            try:
+                # GitHub API URL構築
+                api_url = f"https://api.github.com/repos/{user}/{repo}/contents/{path}"
+                if branch != 'main':
+                    api_url += f"?ref={branch}"
+                
+                # GitHub APIトークンがある場合は使用（環境変数から取得）
+                headers = {}
+                github_token = os.environ.get('GITHUB_TOKEN')
+                if github_token:
+                    headers['Authorization'] = f'token {github_token}'
+                
+                response = requests.get(api_url, headers=headers, timeout=30)
+                
+                if response.status_code == 403:
+                    # レート制限の場合、代替方法を使用
+                    st.warning("⚠️ GitHub APIのレート制限に達しました。代替方法でファイルを取得します...")
+                    return self._get_github_files_alternative(user, repo, branch, path, file_extensions)
+                
+                response.raise_for_status()
+                
+                files_data = response.json()
+                files = []
+                
+                for item in files_data:
+                    if item['type'] == 'file':
+                        file_name = item['name']
+                        if any(file_name.lower().endswith(ext.lower()) for ext in file_extensions):
+                            # rawファイルURLを生成
+                            raw_url = item['download_url']
+                            files.append({
+                                'name': file_name,
+                                'url': raw_url,
+                                'size': item.get('size', 0),
+                                'description': f"GitHubファイル ({item.get('size', 0)} bytes)"
+                            })
+                
+                # キャッシュに保存
+                cache_key = f"{folder_url}_{','.join(file_extensions)}"
+                st.session_state.web_files_cache[cache_key] = files
+                
+                return files
+                
+            except requests.exceptions.RequestException as e:
+                if "403" in str(e) or "rate limit" in str(e).lower():
+                    # APIレート制限の場合、代替方法を使用
+                    st.warning("⚠️ GitHub APIのレート制限に達しました。代替方法でファイルを取得します...")
+                    return self._get_github_files_alternative(user, repo, branch, path, file_extensions)
+                else:
+                    raise e
+                
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"GitHub APIアクセスエラー: {str(e)}")
+        except json.JSONDecodeError:
+            raise Exception("GitHub APIレスポンスの解析に失敗しました")
+        except Exception as e:
+            raise Exception(f"GitHubフォルダ処理エラー: {str(e)}")
+    
+    def _get_github_files_alternative(self, user, repo, branch, path, file_extensions):
+        """GitHub APIが使えない場合の代替方法（HTMLスクレイピング）"""
+        try:
+            # GitHub Webページから情報を取得
+            web_url = f"https://github.com/{user}/{repo}/tree/{branch}/{path}"
+            
+            response = requests.get(web_url, timeout=30)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            files = []
+            
+            # GitHubのファイルリンクを検索
+            # 新しいGitHubUIに対応したセレクタ
+            file_links = soup.find_all('a', {'class': lambda x: x and 'Link--primary' in x}) if soup.find_all('a', {'class': lambda x: x and 'Link--primary' in x}) else soup.find_all('a', href=True)
+            
+            for link in file_links:
+                href = link.get('href', '')
+                link_text = link.get_text().strip()
+                
+                # ファイルのリンクかチェック
+                if '/blob/' in href and any(link_text.lower().endswith(ext.lower()) for ext in file_extensions):
+                    # raw URLに変換
+                    raw_url = href.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
+                    if not raw_url.startswith('http'):
+                        raw_url = f"https://raw.githubusercontent.com{raw_url}"
+                    
+                    files.append({
+                        'name': link_text,
+                        'url': raw_url,
+                        'size': None,
+                        'description': f"GitHubファイル（代替取得）"
+                    })
+            
+            # さらに代替方法：data-testid属性を使用
+            if not files:
+                file_rows = soup.find_all('div', {'data-testid': lambda x: x and 'file-row' in x}) if soup.find_all('div', {'data-testid': lambda x: x and 'file-row' in x}) else []
+                
+                for row in file_rows:
+                    link = row.find('a', href=True)
+                    if link:
+                        href = link.get('href', '')
+                        link_text = link.get_text().strip()
+                        
+                        if '/blob/' in href and any(link_text.lower().endswith(ext.lower()) for ext in file_extensions):
+                            raw_url = f"https://raw.githubusercontent.com{href.replace('/blob/', '/')}"
+                            
+                            files.append({
+                                'name': link_text,
+                                'url': raw_url,
+                                'size': None,
+                                'description': f"GitHubファイル（代替取得）"
+                            })
+            
+            # それでも見つからない場合、より汎用的な検索
+            if not files:
+                all_links = soup.find_all('a', href=True)
+                for link in all_links:
+                    href = link.get('href', '')
+                    link_text = link.get_text().strip()
+                    
+                    if ('/blob/' in href and 
+                        any(ext.lower() in href.lower() or ext.lower() in link_text.lower() for ext in file_extensions)):
+                        
+                        if href.startswith('/'):
+                            raw_url = f"https://raw.githubusercontent.com{href.replace('/blob/', '/')}"
+                        else:
+                            raw_url = href.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
+                        
+                        file_name = link_text if link_text else os.path.basename(href)
+                        
+                        files.append({
+                            'name': file_name,
+                            'url': raw_url,
+                            'size': None,
+                            'description': f"GitHubファイル（代替取得）"
+                        })
+            
+            # 重複除去
+            seen_names = set()
+            unique_files = []
+            for file_info in files:
+                if file_info['name'] not in seen_names:
+                    seen_names.add(file_info['name'])
+                    unique_files.append(file_info)
+            
+            # キャッシュに保存
+            cache_key = f"{web_url}_{','.join(file_extensions)}"
+            st.session_state.web_files_cache[cache_key] = unique_files
+            
+            return unique_files
+            
+        except Exception as e:
+            raise Exception(f"GitHub代替取得エラー: {str(e)}")
+    
+    def _get_generic_web_folder_files(self, folder_url, file_extensions):
+        """一般的なWebフォルダからファイル一覧を取得（HTMLパース）"""
+        try:
+            response = requests.get(folder_url, timeout=30)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            files = []
+            
+            # リンクを検索
+            links = soup.find_all('a', href=True)
+            
+            for link in links:
+                href = link['href']
+                link_text = link.get_text().strip()
+                
+                # 相対URLを絶対URLに変換
+                if not href.startswith(('http://', 'https://')):
+                    href = urljoin(folder_url, href)
+                
+                # ファイル拡張子をチェック
+                if any(href.lower().endswith(ext.lower()) for ext in file_extensions):
+                    # ファイル名を取得
+                    file_name = os.path.basename(urlparse(href).path)
+                    if not file_name:
+                        file_name = link_text
+                    
+                    files.append({
+                        'name': file_name,
+                        'url': href,
+                        'size': None,
+                        'description': f"Webファイル"
+                    })
+            
+            # 重複除去
+            seen_urls = set()
+            unique_files = []
+            for file_info in files:
+                if file_info['url'] not in seen_urls:
+                    seen_urls.add(file_info['url'])
+                    unique_files.append(file_info)
+            
+            # キャッシュに保存
+            cache_key = f"{folder_url}_{','.join(file_extensions)}"
+            st.session_state.web_files_cache[cache_key] = unique_files
+            
+            return unique_files
+            
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Webフォルダアクセスエラー: {str(e)}")
+        except Exception as e:
+            raise Exception(f"Webフォルダ処理エラー: {str(e)}")
+    
+    def download_file_from_url(self, url):
+        """URLからファイルをダウンロード"""
+        try:
+            # GitHubの生ファイルURLに変換
+            if 'github.com' in url and '/blob/' in url:
+                url = url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
+            
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            
+            return io.BytesIO(response.content)
+            
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"ファイルのダウンロードに失敗しました: {str(e)}")
+    
+    def load_shapefile_from_url(self, url):
+        """URLからShapefileを読み込み"""
+        try:
+            file_obj = self.download_file_from_url(url)
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # ZIPファイルとして展開を試行
+                try:
+                    with zipfile.ZipFile(file_obj, 'r') as zip_ref:
+                        zip_ref.extractall(temp_dir)
+                    
+                    # SHPファイルを探す
+                    shp_files = [f for f in os.listdir(temp_dir) if f.endswith('.shp')]
+                    
+                    if shp_files:
+                        shp_path = os.path.join(temp_dir, shp_files[0])
+                        return gpd.read_file(shp_path)
+                    else:
+                        raise Exception("ZIPファイル内にSHPファイルが見つかりません")
+                        
+                except zipfile.BadZipFile:
+                    # ZIPファイルでない場合、直接SHPファイルとして読み込みを試行
+                    file_obj.seek(0)  # ファイルポインタをリセット
+                    
+                    # 一時的にファイルを保存
+                    temp_file = os.path.join(temp_dir, "temp_file")
+                    with open(temp_file, 'wb') as f:
+                        f.write(file_obj.read())
+                    
+                    # 拡張子を推測してリネーム
+                    if url.lower().endswith('.shp'):
+                        shp_file = temp_file + '.shp'
+                        os.rename(temp_file, shp_file)
+                        return gpd.read_file(shp_file)
+                    else:
+                        return gpd.read_file(temp_file)
+                        
+        except Exception as e:
+            raise Exception(f"Shapefileの読み込みに失敗しました: {str(e)}")
+    
+    def create_kml_from_geodataframe(self, gdf, name="地番データ"):
+        """GeoPandasデータフレームからKMLファイルを作成（座標変換付き）"""
+        try:
+            # WGS84（緯度経度）に座標変換
+            gdf_wgs84 = gdf.to_crs(epsg=4326)
+            
+            # KMLのルート要素を作成
+            kml = ET.Element("kml", xmlns="http://www.opengis.net/kml/2.2")
+            document = ET.SubElement(kml, "Document")
+            doc_name = ET.SubElement(document, "name")
+            doc_name.text = name
+            
+            # スタイルを定義
+            style = ET.SubElement(document, "Style", id="PolygonStyle")
+            line_style = ET.SubElement(style, "LineStyle")
+            line_color = ET.SubElement(line_style, "color")
+            line_color.text = "ff0000ff"  # 赤色
+            line_width = ET.SubElement(line_style, "width")
+            line_width.text = "2"
+            
+            poly_style = ET.SubElement(style, "PolyStyle")
+            poly_color = ET.SubElement(poly_style, "color")
+            poly_color.text = "3300ff00"  # 半透明緑
+            
+            # 各レコードに対してPlacemarkを作成
+            for idx, row in gdf_wgs84.iterrows():
+                placemark = ET.SubElement(document, "Placemark")
+                
+                # 名前を設定
+                pm_name = ET.SubElement(placemark, "name")
+                if '地番' in row:
+                    pm_name.text = str(row['地番'])
+                else:
+                    pm_name.text = f"地番_{idx}"
+                
+                # 説明を設定
+                description = ET.SubElement(placemark, "description")
+                desc_text = ""
+                for col in gdf_wgs84.columns:
+                    if col != 'geometry':
+                        desc_text += f"{col}: {row[col]}<br/>"
+                description.text = desc_text
+                
+                # スタイルを適用
+                style_url = ET.SubElement(placemark, "styleUrl")
+                style_url.text = "#PolygonStyle"
+                
+                # ジオメトリを処理
+                geom = row['geometry']
+                if geom.geom_type == 'Polygon':
+                    self._add_polygon_to_placemark(placemark, geom)
+                elif geom.geom_type == 'MultiPolygon':
+                    for poly in geom.geoms:
+                        self._add_polygon_to_placemark(placemark, poly)
+                elif geom.geom_type == 'Point':
+                    self._add_point_to_placemark(placemark, geom)
+            
+            # XMLを整形して文字列として返す
+            rough_string = ET.tostring(kml, 'unicode')
+            reparsed = minidom.parseString(rough_string)
+            pretty_xml = reparsed.toprettyxml(indent="  ")
+            
+            return pretty_xml
+            
+        except Exception as e:
+            st.error(f"KML作成エラー: {str(e)}")
+            return None
+    
+    def _add_polygon_to_placemark(self, placemark, polygon):
+        """PolygonをPlacemarkに追加"""
+        multigeometry = placemark.find("MultiGeometry")
+        if multigeometry is None:
+            multigeometry = ET.SubElement(placemark, "MultiGeometry")
+        
+        kml_polygon = ET.SubElement(multigeometry, "Polygon")
+        
+        # 外環を追加
+        outer_boundary = ET.SubElement(kml_polygon, "outerBoundaryIs")
+        linear_ring = ET.SubElement(outer_boundary, "LinearRing")
+        coordinates = ET.SubElement(linear_ring, "coordinates")
+        
+        # 座標を文字列に変換
+        coord_str = ""
+        for x, y in polygon.exterior.coords:
+            coord_str += f"{x},{y},0 "
+        coordinates.text = coord_str.strip()
+        
+        # 内環がある場合は追加
+        for interior in polygon.interiors:
+            inner_boundary = ET.SubElement(kml_polygon, "innerBoundaryIs")
+            inner_ring = ET.SubElement(inner_boundary, "LinearRing")
+            inner_coordinates = ET.SubElement(inner_ring, "coordinates")
+            
+            inner_coord_str = ""
+            for x, y in interior.coords:
+                inner_coord_str += f"{x},{y},0 "
+            inner_coordinates.text = inner_coord_str.strip()
+    
+    def _add_point_to_placemark(self, placemark, point):
+        """PointをPlacemarkに追加"""
+        kml_point = ET.SubElement(placemark, "Point")
+        coordinates = ET.SubElement(kml_point, "coordinates")
+        coordinates.text = f"{point.x},{point.y},0"
+    
+    def extract_data(self, gdf, oaza, chome, koaza, chiban, range_m):
+        """データ抽出処理（丁目・小字対応）"""
+        try:
+            # 必要な列の存在確認
+            required_columns = ['大字名', '地番']
+            missing_columns = [col for col in required_columns if col not in gdf.columns]
+            
+            if missing_columns:
+                return None, None, f"必要な列が見つかりません: {missing_columns}"
+            
+            # NULL値をチェック
+            null_check = {}
+            for col in required_columns:
+                null_count = gdf[col].isnull().sum()
+                if null_count > 0:
+                    null_check[col] = null_count
+            
+            if null_check:
+                warning_msg = "警告: NULL値が含まれています - " + ", ".join([f"{k}: {v}件" for k, v in null_check.items()])
+                st.warning(warning_msg)
+            
+            # 検索条件を構築（丁目・小字の有無に応じて）
+            search_condition = (
+                (gdf['大字名'] == oaza) & 
+                (gdf['地番'] == chiban) &
+                (gdf['大字名'].notna()) &
+                (gdf['地番'].notna())
+            )
+            
+            # 丁目が指定されている場合は条件に追加
+            if chome is not None and chome != "選択なし" and '丁目名' in gdf.columns:
+                search_condition = search_condition & (gdf['丁目名'] == chome) & (gdf['丁目名'].notna())
+            
+            # 小字が指定されている場合は条件に追加
+            if koaza is not None and koaza != "選択なし" and '小字名' in gdf.columns:
+                search_condition = search_condition & (gdf['小字名'] == koaza) & (gdf['小字名'].notna())
+            
+            df = gdf[search_condition]
+            
+            if df.empty:
+                # デバッグ情報を提供
+                debug_info = []
+                oaza_matches = gdf[gdf['大字名'] == oaza]['大字名'].count()
+                chiban_matches = gdf[gdf['地番'] == chiban]['地番'].count()
+                
+                debug_info.append(f"大字名'{oaza}'の該当件数: {oaza_matches}")
+                debug_info.append(f"地番'{chiban}'の該当件数: {chiban_matches}")
+                
+                if chome and chome != "選択なし" and '丁目名' in gdf.columns:
+                    chome_matches = gdf[gdf['丁目名'] == chome]['丁目名'].count()
+                    debug_info.append(f"丁目名'{chome}'の該当件数: {chome_matches}")
+                
+                if koaza and koaza != "選択なし" and '小字名' in gdf.columns:
+                    koaza_matches = gdf[gdf['小字名'] == koaza]['小字名'].count()
+                    debug_info.append(f"小字名'{koaza}'の該当件数: {koaza_matches}")
+                
+                return None, None, f"該当する筆が見つかりませんでした。{' / '.join(debug_info)}"
+            
+            # 利用可能な列のみを選択
+            available_columns = ["大字名", "地番", "geometry"]
+            if "丁目名" in gdf.columns:
+                available_columns.insert(1, "丁目名")
+            if "小字名" in gdf.columns:
+                insert_position = 2 if "丁目名" in available_columns else 1
+                available_columns.insert(insert_position, "小字名")
+            
+            # 存在する列のみでデータフレームを作成
+            existing_columns = [col for col in available_columns if col in df.columns]
+            df_summary = df.reindex(columns=existing_columns)
+            
+            # geometryカラムが存在し、有効かチェック
+            if 'geometry' not in df_summary.columns:
+                return None, None, "geometry列が見つかりません"
+            
+            if df_summary['geometry'].isnull().any():
+                return None, None, "geometry列にNULL値が含まれています"
+            
+            # 中心点計算と周辺筆抽出
+            cen = df_summary.geometry.centroid
+            
+            cen_gdf = gpd.GeoDataFrame(geometry=cen)
+            cen_gdf['x'] = cen_gdf.geometry.x
+            cen_gdf['y'] = cen_gdf.geometry.y
+            
+            # 検索範囲の4角ポイント計算
+            i1 = cen_gdf['x'] + range_m
+            i2 = cen_gdf['x'] - range_m
+            i3 = cen_gdf['y'] + range_m
+            i4 = cen_gdf['y'] - range_m
+            
+            x1, y1 = i3.iloc[0], i1.iloc[0]
+            x2, y2 = i4.iloc[0], i2.iloc[0]
+            
+            # 4つのポイントを定義
+            top_right = [x1, y1]
+            lower_left = [x2, y2]
+            lower_right = [x1, y2]
+            top_left = [x2, y1]
+            
+            points = pd.DataFrame([top_right, lower_left, lower_right, top_left],
+                                index=["top_right", "lower_left", "lower_right", "top_left"],
+                                columns=["lon", "lat"])
+            
+            # ジオメトリ作成
+            geometry = [Point(xy) for xy in zip(points.lat, points.lon)]
+            four_points_gdf = gpd.GeoDataFrame(points, geometry=geometry)
+            
+            # 検索範囲のポリゴン作成
+            sq = four_points_gdf.dissolve().convex_hull
+            
+            # オーバーレイ処理（NULL値を除外したデータで）
+            df1 = gpd.GeoDataFrame({'geometry': sq})
+            df1 = df1.set_crs(gdf.crs)
+            
+            # 地番とgeometryが両方とも有効なデータのみを使用
+            valid_data = gdf[(gdf['地番'].notna()) & (gdf['geometry'].notna())].copy()
+            
+            # 周辺筆抽出用のデータフレーム作成（利用可能な列のみ使用）
+            overlay_columns = ['地番', 'geometry']
+            if '大字名' in valid_data.columns:
+                overlay_columns.insert(0, '大字名')
+            if '丁目名' in valid_data.columns:
+                overlay_columns.insert(-1, '丁目名')
+            if '小字名' in valid_data.columns:
+                overlay_columns.insert(-1, '小字名')
+            
+            existing_overlay_columns = [col for col in overlay_columns if col in valid_data.columns]
+            df2 = gpd.GeoDataFrame(valid_data[existing_overlay_columns])
+            
+            overlay_gdf = df1.overlay(df2, how='intersection')
+            
+            return df_summary, overlay_gdf, f"対象筆: {len(df_summary)}件, 周辺筆: {len(overlay_gdf)}件"
+            
+        except Exception as e:
+            return None, None, f"エラー: {str(e)}"
+
+def get_chome_options(gdf, selected_oaza):
+    """指定された大字名に対応する丁目の選択肢を取得"""
+    try:
+        if '丁目名' not in gdf.columns:
+            return None
+        
+        # 指定された大字名でフィルタリング
+        filtered_gdf = gdf[
+            (gdf['大字名'] == selected_oaza) & 
+            (gdf['大字名'].notna()) &
+            (gdf['丁目名'].notna())
+        ]
+        
+        if len(filtered_gdf) == 0:
+            return None
+        
+        # 丁目名のユニークな値を取得してソート
+        chome_list = sorted(filtered_gdf['丁目名'].unique())
+        
+        return chome_list
+        
+    except Exception as e:
+        st.error(f"丁目名取得エラー: {str(e)}")
+        return None
+
+def get_koaza_options(gdf, selected_oaza, selected_chome=None):
+    """指定された大字名（及び丁目名）に対応する小字の選択肢を取得"""
+    try:
+        if '小字名' not in gdf.columns:
+            return None
+        
+        # フィルタ条件を構築
+        filter_condition = (
+            (gdf['大字名'] == selected_oaza) & 
+            (gdf['大字名'].notna()) &
+            (gdf['小字名'].notna())
         )
         
-        if selected_file != "選択してください":
-            selected_file_info = next((f for f in st.session_state.matching_files if f["name"] == selected_file), None)
+        # 丁目が指定されている場合は条件に追加
+        if selected_chome and selected_chome != "選択なし" and '丁目名' in gdf.columns:
+            filter_condition = filter_condition & (gdf['丁目名'] == selected_chome) & (gdf['丁目名'].notna())
+        
+        # 指定された条件でフィルタリング
+        filtered_gdf = gdf[filter_condition]
+        
+        if len(filtered_gdf) == 0:
+            return None
+        
+        # 小字名のユニークな値を取得してソート
+        koaza_list = sorted(filtered_gdf['小字名'].unique())
+        
+        return koaza_list
+        
+    except Exception as e:
+        st.error(f"小字名取得エラー: {str(e)}")
+        return None
+
+def main():
+    st.title("🗺️ 電子公図データ抽出ツール")
+    st.markdown("---")
+    
+    extractor = KojiWebExtractor()
+    
+    # サイドバー
+    st.sidebar.header("📋 プリセットファイル")
+    
+    # Webフォルダからのプリセット選択
+    st.sidebar.subheader("🌐 Webフォルダからのプリセット")
+    
+    # デフォルトのWebフォルダURL（例）
+    default_folder_urls = [
+        "https://github.com/kentashimoji/koji-data-extractor/tree/549107659362957e65bb3183f7831c3d1c259cc8/47okinawa"
+    ]
+    
+    # カスタムフォルダURL入力
+    custom_folder_url = st.sidebar.text_input(
+        "カスタムフォルダURL",
+        placeholder="https://github.com/user/repo/tree/main/data",
+        help="Shapefileが格納されているWebフォルダのURLを入力してください"
+    )
+    
+    # フォルダURL選択
+    folder_options = ["カスタム"] + [f"サンプル{i+1}" for i in range(len(default_folder_urls))]
+    selected_folder_option = st.sidebar.selectbox(
+        "フォルダを選択",
+        folder_options,
+        help="プリセットフォルダまたはカスタムURLを選択"
+    )
+    
+    # 選択されたフォルダURLを決定
+    if selected_folder_option == "カスタム":
+        folder_url = custom_folder_url
+    else:
+        folder_index = int(selected_folder_option.replace("サンプル", "")) - 1
+        folder_url = default_folder_urls[folder_index]
+    
+    # ファイル一覧を取得
+    web_files = []
+    if folder_url:
+        if st.sidebar.button("📂 フォルダからファイル一覧を取得", type="secondary"):
+            with st.spinner("Webフォルダからファイル一覧を取得中..."):
+                try:
+                    web_files = extractor.get_files_from_web_folder(folder_url)
+                except Exception as e:
+                    if "rate limit" in str(e).lower() or "403" in str(e):
+                        st.sidebar.error("❌ GitHub APIのレート制限に達しました。しばらく待ってから再試行してください。")
+                        st.sidebar.info("💡 ヒント: GitHubトークンを環境変数 'GITHUB_TOKEN' に設定すると制限が緩和されます。")
+                    else:
+                        st.sidebar.error(f"❌ エラー: {str(e)}")
+                    web_files = []
             
-            if selected_file_info:
-                st.sidebar.info(f"**{selected_file_info['name']}**\n\n{selected_file_info['description']}")
+            if web_files:
+                st.sidebar.success(f"✅ {len(web_files)}個のファイルが見つかりました")
+                st.session_state.current_web_files = web_files
+                st.session_state.current_folder_url = folder_url
+            else:
+                st.sidebar.warning("❌ 対応ファイルが見つかりませんでした")
+    
+    # キャッシュされたファイル一覧を使用
+    if 'current_web_files' in st.session_state:
+        web_files = st.session_state.current_web_files
+        
+        if web_files:
+            st.sidebar.write(f"**📁 {st.session_state.current_folder_url}**")
+            st.sidebar.write(f"利用可能ファイル: {len(web_files)}個")
+            
+            # ファイル選択
+            file_options = ["選択なし"] + [f["name"] for f in web_files]
+            selected_file = st.sidebar.selectbox(
+                "ファイルを選択",
+                file_options,
+                help="読み込むShapefileを選択してください"
+            )
+            
+            if selected_file != "選択なし":
+                # 選択されたファイルの詳細を表示
+                selected_file_info = next((f for f in web_files if f["name"] == selected_file), None)
+                if selected_file_info:
+                    st.sidebar.info(f"**{selected_file_info['name']}**\n\n{selected_file_info['description']}")
+                    
+                    if st.sidebar.button("📥 選択ファイルを読み込み", type="primary"):
+                        try:
+                            with st.spinner(f"ファイル「{selected_file}」を読み込み中..."):
+                                st.session_state.gdf = extractor.load_shapefile_from_url(selected_file_info['url'])
+                            
+                            st.sidebar.success("✅ ファイル読み込み完了!")
+                            st.sidebar.info(f"📊 レコード数: {len(st.session_state.gdf):,}件")
+                            
+                            if st.session_state.gdf.crs:
+                                st.sidebar.info(f"🗺️ 座標系: {st.session_state.gdf.crs}")
+                            
+                            # 丁目名・小字名列の存在確認
+                            if '丁目名' in st.session_state.gdf.columns:
+                                chome_count = st.session_state.gdf['丁目名'].notna().sum()
+                                st.sidebar.info(f"🏘️ 丁目データ: {chome_count}件")
+                            
+                            if '小字名' in st.session_state.gdf.columns:
+                                koaza_count = st.session_state.gdf['小字名'].notna().sum()
+                                st.sidebar.info(f"🏞️ 小字データ: {koaza_count}件")
+                            
+                            # データソース情報を記録
+                            st.session_state.data_source = "Webフォルダ"
+                            st.session_state.current_preset = selected_file
+                            st.session_state.file_info = selected_file_info['url']
+                                
+                        except Exception as e:
+                            st.sidebar.error(f"❌ ファイル読み込みエラー: {str(e)}")
+    
+    # 従来のプリセット機能（固定リスト）
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📋 固定プリセット")
+    
+    # プリセットファイル機能
+    preset_files = {
+        "サンプル1": {
+            "name": "東京都サンプル地番データ",
+            "url": "https://example.com/tokyo_sample.zip",
+            "description": "東京都の地番データサンプル（丁目・小字対応）"
+        },
+        "サンプル2": {
+            "name": "大阪府サンプル地番データ", 
+            "url": "https://example.com/osaka_sample.zip",
+            "description": "大阪府の地番データサンプル（小字対応）"
+        },
+        "サンプル3": {
+            "name": "基本地番データ",
+            "url": "https://example.com/basic_sample.zip", 
+            "description": "基本的な地番データ（大字名・地番のみ）"
+        }
+    }
+    
+    # プリセット選択
+    selected_preset = st.sidebar.selectbox(
+        "固定プリセットファイルを選択",
+        ["選択なし"] + list(preset_files.keys()),
+        help="事前に設定されたサンプルファイルから選択できます"
+    )
+    
+    if selected_preset != "選択なし":
+        preset_info = preset_files[selected_preset]
+        st.sidebar.info(f"**{preset_info['name']}**\n\n{preset_info['description']}")
+        
+        if st.sidebar.button("📋 固定プリセットを読み込み", type="secondary"):
+            try:
+                with st.spinner(f"プリセット「{selected_preset}」を読み込み中..."):
+                    st.session_state.gdf = extractor.load_shapefile_from_url(preset_info['url'])
                 
-                if st.sidebar.button("📥 選択ファイルを読み込み", type="primary"):
-                    try:
-                        with st.spinner(f"ファイル「{selected_file}」を読み込み中..."):
-                            st.session_state.gdf = extractor.load_shapefile_from_url(selected_file_info['url'])
+                st.sidebar.success("✅ プリセット読み込み完了!")
+                st.sidebar.info(f"📊 レコード数: {len(st.session_state.gdf):,}件")
+                
+                if st.session_state.gdf.crs:
+                    st.sidebar.info(f"🗺️ 座標系: {st.session_state.gdf.crs}")
+                
+                # 丁目名・小字名列の存在確認
+                if '丁目名' in st.session_state.gdf.columns:
+                    chome_count = st.session_state.gdf['丁目名'].notna().sum()
+                    st.sidebar.info(f"🏘️ 丁目データ: {chome_count}件")
+                
+                if '小字名' in st.session_state.gdf.columns:
+                    koaza_count = st.session_state.gdf['小字名'].notna().sum()
+                    st.sidebar.info(f"🏞️ 小字データ: {koaza_count}件")
+                
+                # データソース情報を記録
+                st.session_state.data_source = "固定プリセット"
+                st.session_state.current_preset = selected_preset
+                st.session_state.file_info = preset_info['name']
+                    
+            except Exception as e:
+                st.sidebar.error(f"❌ プリセット読み込みエラー: {str(e)}")
+    
+    st.sidebar.markdown("---")
+    st.sidebar.header("📂 独自データソース選択")
+    
+    # データソース選択
+    data_source = st.sidebar.radio(
+        "独自データソースを選択",
+        ["📁 ローカルファイル", "🌐 Web URL", "🐙 GitHub"],
+        help="独自のデータファイルを使用する場合の取得方法を選択してください"
+    )
+    
+    if data_source == "📁 ローカルファイル":
+        # 従来のファイルアップロード
+        uploaded_file = st.sidebar.file_uploader(
+            "SHPファイルをアップロード",
+            type=['zip'],
+            help="SHPファイル一式をZIPで圧縮してアップロードしてください"
+        )
+        
+        if uploaded_file is not None:
+            try:
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    # ZIPファイルを展開
+                    with zipfile.ZipFile(uploaded_file, 'r') as zip_ref:
+                        zip_ref.extractall(temp_dir)
+                    
+                    # SHPファイルを探す
+                    shp_files = [f for f in os.listdir(temp_dir) if f.endswith('.shp')]
+                    
+                    if shp_files:
+                        shp_path = os.path.join(temp_dir, shp_files[0])
+                        st.session_state.gdf = gpd.read_file(shp_path)
                         
                         st.sidebar.success("✅ ファイル読み込み完了!")
                         st.sidebar.info(f"📊 レコード数: {len(st.session_state.gdf):,}件")
                         
+                        # 座標参照系の確認
                         if st.session_state.gdf.crs:
                             st.sidebar.info(f"🗺️ 座標系: {st.session_state.gdf.crs}")
                         
@@ -36,12 +856,105 @@
                             st.sidebar.info(f"🏞️ 小字データ: {koaza_count}件")
                         
                         # データソース情報を記録
-                        st.session_state.data_source = "Excel自治体選択"
-                        st.session_state.current_file = selected_file
-                        st.session_state.file_url = selected_file_info['url']
-                            
-                    except Exception as e:
-                        st.sidebar.error(f"❌ ファイル読み込みエラー: {str(e)}")
+                        st.session_state.data_source = "ローカルファイル"
+                        st.session_state.file_info = uploaded_file.name
+                        if 'current_preset' in st.session_state:
+                            del st.session_state.current_preset
+                    else:
+                        st.sidebar.error("❌ SHPファイルが見つかりません")
+                        
+            except Exception as e:
+                st.sidebar.error(f"❌ ファイル読み込みエラー: {str(e)}")
+    
+    elif data_source == "🌐 Web URL":
+        # Web URL入力
+        web_url = st.sidebar.text_input(
+            "ファイルのURL",
+            placeholder="https://example.com/data.zip",
+            help="ZIPファイルまたはSHPファイルの直接URLを入力してください"
+        )
+        
+        if st.sidebar.button("🌐 URLから読み込み", type="primary"):
+            if web_url:
+                try:
+                    with st.spinner("URLからファイルを読み込み中..."):
+                        st.session_state.gdf = extractor.load_shapefile_from_url(web_url)
+                    
+                    st.sidebar.success("✅ ファイル読み込み完了!")
+                    st.sidebar.info(f"📊 レコード数: {len(st.session_state.gdf):,}件")
+                    
+                    if st.session_state.gdf.crs:
+                        st.sidebar.info(f"🗺️ 座標系: {st.session_state.gdf.crs}")
+                    
+                    # 丁目名・小字名列の存在確認
+                    if '丁目名' in st.session_state.gdf.columns:
+                        chome_count = st.session_state.gdf['丁目名'].notna().sum()
+                        st.sidebar.info(f"🏘️ 丁目データ: {chome_count}件")
+                    
+                    if '小字名' in st.session_state.gdf.columns:
+                        koaza_count = st.session_state.gdf['小字名'].notna().sum()
+                        st.sidebar.info(f"🏞️ 小字データ: {koaza_count}件")
+                    
+                    # データソース情報を記録
+                    st.session_state.data_source = "Web URL"
+                    st.session_state.file_info = web_url
+                    if 'current_preset' in st.session_state:
+                        del st.session_state.current_preset
+                        
+                except Exception as e:
+                    st.sidebar.error(f"❌ {str(e)}")
+            else:
+                st.sidebar.error("URLを入力してください")
+    
+    elif data_source == "🐙 GitHub":
+        # GitHub URL入力
+        col_owner, col_repo = st.sidebar.columns(2)
+        with col_owner:
+            github_owner = st.text_input("GitHubユーザー名", placeholder="username")
+        with col_repo:
+            github_repo = st.text_input("リポジトリ名", placeholder="repository")
+        
+        github_path = st.sidebar.text_input(
+            "ファイルパス",
+            placeholder="data/shapefile.zip",
+            help="リポジトリ内のファイルパスを入力してください"
+        )
+        
+        github_branch = st.sidebar.text_input("ブランチ名", value="main")
+        
+        if st.sidebar.button("🐙 GitHubから読み込み", type="primary"):
+            if github_owner and github_repo and github_path:
+                try:
+                    github_url = f"https://github.com/{github_owner}/{github_repo}/blob/{github_branch}/{github_path}"
+                    
+                    with st.spinner("GitHubからファイルを読み込み中..."):
+                        st.session_state.gdf = extractor.load_shapefile_from_url(github_url)
+                    
+                    st.sidebar.success("✅ ファイル読み込み完了!")
+                    st.sidebar.info(f"📊 レコード数: {len(st.session_state.gdf):,}件")
+                    
+                    if st.session_state.gdf.crs:
+                        st.sidebar.info(f"🗺️ 座標系: {st.session_state.gdf.crs}")
+                    
+                    # 丁目名・小字名列の存在確認
+                    if '丁目名' in st.session_state.gdf.columns:
+                        chome_count = st.session_state.gdf['丁目名'].notna().sum()
+                        st.sidebar.info(f"🏘️ 丁目データ: {chome_count}件")
+                    
+                    if '小字名' in st.session_state.gdf.columns:
+                        koaza_count = st.session_state.gdf['小字名'].notna().sum()
+                        st.sidebar.info(f"🏞️ 小字データ: {koaza_count}件")
+                    
+                    # データソース情報を記録
+                    st.session_state.data_source = "GitHub"
+                    st.session_state.file_info = github_url
+                    if 'current_preset' in st.session_state:
+                        del st.session_state.current_preset
+                        
+                except Exception as e:
+                    st.sidebar.error(f"❌ {str(e)}")
+            else:
+                st.sidebar.error("GitHubの情報をすべて入力してください")
     
     # メインエリア
     if st.session_state.gdf is not None:
@@ -50,16 +963,11 @@
         with col1:
             st.header("🔍 検索条件")
             
-            # 現在のデータ情報を表示
-            if 'selected_municipality' in st.session_state:
-                st.info(f"📍 現在のデータ: {st.session_state.selected_municipality}")
-                if 'municipality_code' in st.session_state:
-                    st.info(f"🏛️ 自治体コード: {st.session_state.municipality_code}")
-            
-            # 大字名選択
+            # 大字名選択（データが存在する場合のみ）
             selected_oaza = None
             try:
                 if '大字名' in st.session_state.gdf.columns:
+                    # NULL値を除外してソート
                     oaza_series = st.session_state.gdf['大字名'].dropna()
                     if len(oaza_series) > 0:
                         oaza_list = sorted(oaza_series.unique())
@@ -68,24 +976,25 @@
                         st.error("❌ 大字名データがすべてNULLです")
                         selected_oaza = None
                 else:
-                    st.error("❌ '大字名'列が見つかりません。")
+                    st.error("❌ '大字名'列が見つかりません。データの形式を確認してください。")
                     st.write("**利用可能な列:**", list(st.session_state.gdf.columns))
                     selected_oaza = None
             except Exception as e:
                 st.error(f"❌ データ読み込みエラー: {str(e)}")
                 selected_oaza = None
             
-            # 丁目名選択
+            # 丁目名選択（大字名が選択されている場合のみ）
             selected_chome = None
             if selected_oaza is not None:
                 chome_options = get_chome_options(st.session_state.gdf, selected_oaza)
                 
                 if chome_options is not None and len(chome_options) > 0:
+                    # 丁目選択肢がある場合
                     chome_list_with_none = ["選択なし"] + chome_options
                     selected_chome = st.selectbox(
                         "丁目名を選択（任意）", 
                         chome_list_with_none,
-                        help="丁目を指定する場合は選択してください"
+                        help="丁目を指定する場合は選択してください。指定しない場合は「選択なし」のままにしてください。"
                     )
                     
                     if selected_chome == "選択なし":
@@ -94,21 +1003,24 @@
                         st.success(f"✅ 丁目「{selected_chome}」を指定しました")
                         
                 elif '丁目名' in st.session_state.gdf.columns:
+                    # 丁目名列は存在するが、この大字名には丁目データがない
                     st.info("ℹ️ この大字名には丁目データがありません")
                 else:
+                    # 丁目名列自体が存在しない
                     st.info("ℹ️ このデータセットには丁目情報が含まれていません")
             
-            # 小字名選択
+            # 小字名選択（大字名が選択されている場合のみ）
             selected_koaza = None
             if selected_oaza is not None:
                 koaza_options = get_koaza_options(st.session_state.gdf, selected_oaza, selected_chome)
                 
                 if koaza_options is not None and len(koaza_options) > 0:
+                    # 小字選択肢がある場合
                     koaza_list_with_none = ["選択なし"] + koaza_options
                     selected_koaza = st.selectbox(
                         "小字名を選択（任意）", 
                         koaza_list_with_none,
-                        help="小字を指定する場合は選択してください"
+                        help="小字を指定する場合は選択してください。指定しない場合は「選択なし」のままにしてください。"
                     )
                     
                     if selected_koaza == "選択なし":
@@ -117,22 +1029,25 @@
                         st.success(f"✅ 小字「{selected_koaza}」を指定しました")
                         
                 elif '小字名' in st.session_state.gdf.columns:
+                    # 小字名列は存在するが、この大字名（丁目名）には小字データがない
                     condition_text = f"大字名「{selected_oaza}」"
                     if selected_chome and selected_chome != "選択なし":
                         condition_text += f"・丁目名「{selected_chome}」"
                     st.info(f"ℹ️ {condition_text}には小字データがありません")
                 else:
+                    # 小字名列自体が存在しない
                     st.info("ℹ️ このデータセットには小字情報が含まれていません")
             
             # 地番入力
             chiban = st.text_input("地番を入力", value="1174")
             
-            # 検索範囲
+            # 検索範囲を固定値に設定
             range_m = 61
             
             # 抽出ボタン
             if st.button("🚀 データ抽出", type="primary", use_container_width=True):
                 if selected_oaza and chiban:
+                    # 必要な列が存在するかチェック
                     required_columns = ['大字名', '地番']
                     missing_columns = [col for col in required_columns if col not in st.session_state.gdf.columns]
                     
@@ -169,15 +1084,16 @@
         with col2:
             st.header("📊 データ一覧")
             
-            # 現在のデータ情報を表示
-            if 'selected_municipality' in st.session_state:
+            # 現在のデータソース情報（Webフォルダ情報を含む）
+            if 'data_source' in st.session_state:
                 with st.expander("ℹ️ 現在のデータ情報"):
-                    st.write(f"**データソース**: Excel自治体データ連携")
-                    st.write(f"**選択自治体**: {st.session_state.selected_municipality}")
-                    if 'municipality_code' in st.session_state:
-                        st.write(f"**自治体コード**: {st.session_state.municipality_code}")
-                    if 'current_file' in st.session_state:
-                        st.write(f"**読み込みファイル**: {st.session_state.current_file}")
+                    st.write(f"**データソース**: {st.session_state.data_source}")
+                    if 'current_preset' in st.session_state:
+                        st.write(f"**プリセット**: {st.session_state.current_preset}")
+                    if 'file_info' in st.session_state:
+                        st.write(f"**ファイル**: {st.session_state.file_info}")
+                    if 'current_folder_url' in st.session_state:
+                        st.write(f"**フォルダURL**: {st.session_state.current_folder_url}")
                     
                     if st.session_state.gdf is not None:
                         st.write(f"**レコード数**: {len(st.session_state.gdf):,}件")
@@ -196,24 +1112,12 @@
                             total_count = len(st.session_state.gdf)
                             st.write(f"**小字データ**: {koaza_count}/{total_count}件 ({koaza_count/total_count*100:.1f}%)")
             
-            # 自治体データ情報の表示
-            if st.session_state.municipal_data is not None:
-                if st.checkbox("🏛️ 自治体データ情報を表示"):
-                    st.write("**自治体データベース情報:**")
-                    st.write(f"- **総自治体数**: {len(st.session_state.municipal_data)}件")
-                    st.write(f"- **都道府県数**: {st.session_state.municipal_data['都道府県名（漢字）'].nunique()}件")
+            # Webフォルダから取得したファイル一覧の表示
+            if 'current_web_files' in st.session_state and st.session_state.current_web_files:
+                if st.checkbox("🌐 Webフォルダファイル一覧を表示"):
+                    st.write(f"**📂 {st.session_state.current_folder_url}のファイル一覧:**")
                     
-                    # 都道府県別の自治体数
-                    prefecture_counts = st.session_state.municipal_data['都道府県名（漢字）'].value_counts().head(10)
-                    st.write("**都道府県別自治体数（上位10位）:**")
-                    st.dataframe(prefecture_counts, use_container_width=True)
-            
-            # 検索結果ファイル一覧
-            if 'matching_files' in st.session_state and st.session_state.matching_files:
-                if st.checkbox("🗂️ 検索結果ファイル一覧を表示"):
-                    st.write(f"**🎯 {st.session_state.selected_municipality}の対象ファイル一覧:**")
-                    
-                    files_df = pd.DataFrame(st.session_state.matching_files)
+                    files_df = pd.DataFrame(st.session_state.current_web_files)
                     
                     # ファイル情報を整理して表示
                     display_df = pd.DataFrame({
@@ -225,6 +1129,20 @@
                     })
                     
                     st.dataframe(display_df, use_container_width=True)
+                    
+                    # 更新ボタン
+                    if st.button("🔄 ファイル一覧を更新"):
+                        # キャッシュをクリア
+                        if 'web_files_cache' in st.session_state:
+                            st.session_state.web_files_cache.clear()
+                        
+                        with st.spinner("ファイル一覧を更新中..."):
+                            new_files = extractor.get_files_from_web_folder(st.session_state.current_folder_url)
+                            if new_files:
+                                st.session_state.current_web_files = new_files
+                                st.success(f"✅ {len(new_files)}個のファイルを取得しました")
+                            else:
+                                st.warning("❌ ファイルが見つかりませんでした")
             
             # 大字名・丁目名・小字名のサマリー
             if st.checkbox("大字名・丁目名・小字名一覧を表示"):
@@ -253,6 +1171,26 @@
                                     koaza_summary = koaza_clean.value_counts()
                                     st.dataframe(koaza_summary.head(20), use_container_width=True)
                             
+                            # 大字名×丁目名×小字名のクロス集計
+                            cross_columns = ['大字名']
+                            if '丁目名' in st.session_state.gdf.columns:
+                                cross_columns.append('丁目名')
+                            if '小字名' in st.session_state.gdf.columns:
+                                cross_columns.append('小字名')
+                            
+                            if len(cross_columns) > 1:
+                                st.write(f"**{' × '.join(cross_columns)}の組み合わせ:**")
+                                cross_data = st.session_state.gdf.copy()
+                                
+                                # 各列がNULLでないデータのみ抽出
+                                for col in cross_columns:
+                                    cross_data = cross_data[cross_data[col].notna()]
+                                
+                                if len(cross_data) > 0:
+                                    cross_summary = cross_data.groupby(cross_columns).size().reset_index(name='件数')
+                                    cross_summary = cross_summary.sort_values('件数', ascending=False)
+                                    st.dataframe(cross_summary.head(20), use_container_width=True)
+                            
                             # NULL値の情報も表示
                             null_info = []
                             for col in ['大字名', '丁目名', '小字名']:
@@ -270,7 +1208,7 @@
                 except Exception as e:
                     st.error(f"データ表示エラー: {str(e)}")
             
-            # 地番検索
+            # 地番検索（改良版）
             if st.checkbox("地番検索"):
                 search_term = st.text_input("地番を検索", placeholder="例: 1174")
                 
@@ -335,6 +1273,9 @@
                             st.warning("'地番'列が見つかりません")
                     except Exception as e:
                         st.error(f"検索エラー: {str(e)}")
+                        # デバッグ情報
+                        st.write("地番列のデータ型:", st.session_state.gdf['地番'].dtype)
+                        st.write("地番列のNULL数:", st.session_state.gdf['地番'].isnull().sum())
             
             # データ構造の確認
             if st.checkbox("📋 データ構造を確認"):
@@ -377,7 +1318,7 @@
                     
                 except Exception as e:
                     st.error(f"データ構造確認エラー: {str(e)}")
-    
+        
         # 結果表示とダウンロード
         if 'target_gdf' in st.session_state and 'overlay_gdf' in st.session_state:
             st.markdown("---")
@@ -480,7 +1421,6 @@
             with tab3:
                 st.write("**使用した検索条件:**")
                 search_conditions = {
-                    '自治体': f"{st.session_state.selected_municipality}（{st.session_state.municipality_code}）" if 'selected_municipality' in st.session_state else '不明',
                     '大字名': selected_oaza if 'selected_oaza' in locals() else '不明',
                     '地番': chiban if 'chiban' in locals() else '不明',
                     '検索範囲': "61m（固定）"
@@ -511,756 +1451,112 @@
                     st.write(f"- **{key}**: {value}件")
     
     else:
-        st.info("👆 自治体を選択してファイルを読み込んでください")
+        st.info("👆 データソースを選択してファイルを読み込んでください")
         
-        # 使い方説明
+        # 使い方説明（Webフォルダ機能を含む改良版）
         with st.expander("📖 使い方"):
             st.markdown("""
-            ### 🏛️ Excel自治体データ連携機能
-            **自動自治体コード変換システム** 📊
-            - Excel自治体データ（000925835.xlsx）から自治体情報を自動読み込み
-            - 都道府県 → 市区町村の階層選択
-            - 自治体名から自治体コードへの自動変換
-            - 自治体コードに基づく自動ファイル検索・抽出
+            ### 🌐 新機能: Webフォルダからのプリセット選択
+            **Webフォルダプリセット** 📂
+            - Web上のフォルダから複数のShapefileを自動取得
+            - GitHubフォルダ、一般的なWebディレクトリに対応
+            - ファイル一覧を動的に表示・選択可能
+            - 例: `https://github.com/user/repo/tree/main/data`
             
             **使用手順:**
-            1. **都道府県**をプルダウンから選択
-            2. **自治体**をプルダウンから選択（自治体コードが自動表示）
-            3. **データフォルダURL**を設定（デフォルト値使用可能）
-            4. **「該当ファイルを検索」**ボタンをクリック
-            5. 検索されたファイル一覧から**目的のファイルを選択**
-            6. **「選択ファイルを読み込み」**ボタンでデータを読み込み
+            1. **カスタムフォルダURL**を入力、または**サンプルフォルダ**を選択
+            2. **「フォルダからファイル一覧を取得」**ボタンをクリック
+            3. 取得されたファイル一覧から**目的のファイルを選択**
+            4. **「選択ファイルを読み込み」**ボタンでデータを読み込み
             
-            ### 📋 検索・抽出手順
-            1. **大字名**をドロップダウンから選択
-            2. **丁目名**を選択（丁目データがある場合のみ表示）
-               - 指定しない場合は「選択なし」のまま
-            3. **小字名**を選択（小字データがある場合のみ表示）
-               - 指定しない場合は「選択なし」のまま
-            4. **地番**を入力（例: 1174）
-            5. **データ抽出**ボタンをクリック
-            6. **KMLファイル**をダウンロード
+            ### 📋 データソース（従来機能）
+            **1. 固定プリセット** 📋
+            - 事前設定されたサンプルファイル
+            
+            **2. ローカルファイル** 📁
+            - SHPファイル一式をZIP圧縮してアップロード
+            
+            **3. Web URL** 🌐
+            - 直接アクセス可能なファイルのURL
+            - 例: `https://example.com/data.zip`
+            
+            **4. GitHub** 🐙
+            - GitHubリポジトリ内の個別ファイル
+            - ユーザー名、リポジトリ名、ファイルパスを指定
+            
+            ### 📋 検索手順
+            1. **データソース**を選択してファイルを読み込み
+            2. **大字名**をドロップダウンから選択
+            3. **丁目名**を選択（丁目データがある場合のみ表示）
+               - 丁目を指定したくない場合は「選択なし」のまま
+            4. **小字名**を選択（小字データがある場合のみ表示）
+               - 小字を指定したくない場合は「選択なし」のまま
+            5. **地番**を入力
+            6. **検索範囲**を設定（デフォルト: 61m）
+            7. **データ抽出**ボタンをクリック
+            8. **KMLファイル**をダウンロード
+            
+            ### 🏘️ 丁目・小字機能について
+            - データに「丁目名」「小字名」列が含まれている場合、それぞれでの絞り込みが可能
+            - 大字名を選択すると、その大字に対応する丁目・小字のみが表示されます
+            - 丁目を選択すると、その丁目に対応する小字のみが表示されます
+            - 丁目・小字を指定しない場合は、上位の地域区分内の全ての筆が検索対象になります
             
             ### 🎯 出力ファイル
             - **対象筆KML**: 指定した筆のKMLファイル
-            - **周辺筆KML**: 周辺筆のKMLファイル（61m範囲内）
+            - **周辺筆KML**: 周辺筆のKMLファイル
             - **CSV**: 座標情報付きのCSVファイル
             
-            ### 🔍 検索・分析機能
-            - **Excel連携自治体選択**: 公式データに基づく正確な自治体選択
-            - **自動ファイル発見**: 自治体コードに基づくファイル自動検索
-            - **階層地域選択**: 大字名→丁目名→小字名の階層選択
-            - **地番検索**: 完全一致・部分一致での地番検索
-            - **座標情報表示**: 検索結果に中心座標を表示可能
-            - **統計情報**: 各地域区分の件数・割合の確認
-            - **データ構造確認**: 列情報、NULL値統計、サンプルデータの確認
-            
             ### 🗺️ 対応ソフトウェア
-            - **Google Earth**: KMLファイル直接読み込み
-            - **Google マイマップ**: KMLファイルインポート
-            - **QGIS**: オープンソースGISソフトウェア
-            - **ArcGIS**: 商用GISソフトウェア
-            - **その他**: KML対応のGISソフトウェア全般
+            - Google Earth
+            - Google マイマップ
+            - QGIS
+            - その他GISソフトウェア
             
-            ### 💡 Excel連携の利点
-            - **正確性**: 公式の自治体コード表（総務省データ）に基づく選択
-            - **効率性**: 自治体名から自動でコード変換・ファイル検索
-            - **網羅性**: 全国47都道府県、1700+自治体に対応
-            - **保守性**: Excelファイル更新により最新データに自動対応
-            - **信頼性**: 団体コード（6桁）による確実な識別
+            ### 🔍 検索・分析機能
+            - **地番検索**: 完全一致・部分一致での地番検索
+            - **座標表示**: 検索結果に中心座標を表示可能
+            - **データ構造確認**: 列情報、NULL値統計、サンプルデータの確認
+            - **階層検索**: 大字名→丁目名→小字名の階層での絞り込み検索
+            - **Webフォルダファイル一覧**: 取得したファイルの詳細情報表示
+            - **統計情報**: 各地域区分の件数・割合の確認
             
-            ### 📍 対応データ階層
+            ### 🔗 対応URL形式
+            **Webフォルダ:**
+            - **GitHubフォルダ**: `https://github.com/user/repo/tree/branch/path`
+            - **一般Webディレクトリ**: `https://example.com/data/`
+            
+            **個別ファイル:**
+            - **直接URL**: `https://example.com/shapefile.zip`
+            - **GitHub個別**: `https://github.com/username/repo/blob/main/data.zip`
+            - **GitHub Raw**: `https://raw.githubusercontent.com/username/repo/main/data.zip`
+            
+            ### 📍 地域区分の階層
             ```
-            都道府県（47件）
-            └── 市区町村（1700+件）
-                └── 大字名（データ依存）
-                    ├── 丁目名（任意）
-                    │   └── 小字名（任意）
-                    └── 小字名（任意、丁目なしの場合）
-                        └── 地番（必須）
+            大字名 (必須)
+            ├── 丁目名 (任意)
+            │   └── 小字名 (任意)
+            └── 小字名 (任意、丁目なしの場合)
             ```
             
-            ### 🔧 ファイル命名規則
-            - **推奨形式**: `[自治体コード]_[地域名].zip`
-            - **例**: `472011_那覇市.zip`、`47_沖縄県.zip`
-            - **検索対象**: ファイル名に自治体コード（6桁）または都道府県コード（2桁）を含むファイル
+            ### 💡 Webフォルダ機能の利点
+            - **複数ファイル管理**: 一つのフォルダに複数のShapefileを配置して管理
+            - **動的更新**: フォルダ内容の変更が即座に反映
+            - **バージョン管理**: GitHubを使用した場合、ファイルのバージョン管理が可能
+            - **共有**: チーム内でのデータ共有が容易
+            - **自動発見**: 対応拡張子のファイルを自動検出
             
-            ### ⚠️ 注意事項
-            - **Excel ファイル**: 000925835.xlsx が同じディレクトリに必要
-            - **ネットワーク**: GitHub等からのファイル取得にインターネット接続が必要  
-            - **ファイル形式**: ZIP圧縮されたShapefileセットに対応
-            - **座標系**: 自動でWGS84（緯度経度）に変換してKML出力
+            ### ⚠️ GitHub API制限について
+            - **レート制限**: GitHub APIは1時間あたり60リクエストの制限があります
+            - **制限時の対処**: 制限に達した場合、自動的に代替方法（HTMLスクレイピング）に切り替わります
+            - **トークン使用**: GitHubトークンを環境変数`GITHUB_TOKEN`に設定すると制限が緩和されます（5000リクエスト/時間）
+            - **待機時間**: 制限に達した場合、1時間待ってから再試行してください
             
             ### 🔧 トラブルシューティング
-            - **自治体が見つからない**: Excel データの更新または自治体名の表記確認
-            - **ファイルが見つからない**: 自治体コードがファイル名に含まれているか確認
-            - **読み込みエラー**: Shapefileの形式、ZIP圧縮状態を確認
-            - **座標エラー**: 元データの座標参照系（CRS）を確認
+            - **403エラー**: GitHub APIレート制限の可能性があります。時間をおいて再試行してください
+            - **ファイルが見つからない**: フォルダのURLが正しいか、ファイルが.zipまたは.shp形式か確認してください
+            - **認証エラー**: プライベートリポジトリの場合、適切なアクセス権限が必要です
             """)
 
 if __name__ == "__main__":
     main()
-            # -*- coding: utf-8 -*-
-"""
-電子公図データ抽出Webアプリ (Streamlit版) - Excel自治体データ連携版
-"""
-
-import streamlit as st
-import geopandas as gpd
-import pandas as pd
-from shapely.geometry import Point, Polygon, MultiPolygon
-import xml.etree.ElementTree as ET
-from xml.dom import minidom
-import zipfile
-import io
-import tempfile
-import os
-import requests
-from urllib.parse import urlparse, urljoin
-import re
-from bs4 import BeautifulSoup
-import json
-
-# ページ設定
-st.set_page_config(
-    page_title="電子公図データ抽出ツール",
-    page_icon="🗺️",
-    layout="wide"
-)
-
-class KojiExcelMunicipalExtractor:
-    def __init__(self):
-        if 'gdf' not in st.session_state:
-            st.session_state.gdf = None
-        if 'web_files_cache' not in st.session_state:
-            st.session_state.web_files_cache = {}
-        if 'municipal_data' not in st.session_state:
-            st.session_state.municipal_data = None
-    
-    def load_municipal_data_from_excel(self, excel_file_path):
-        """Excelファイルから自治体データを読み込み"""
-        try:
-            # Excelファイルを読み込み
-            df = pd.read_excel(excel_file_path, sheet_name=0)
-            
-            # 列名を正規化（改行文字を除去）
-            df.columns = df.columns.str.replace('\r\n', '').str.replace('\n', '')
-            
-            # 必要な列が存在するかチェック
-            required_columns = ['団体コード', '都道府県名（漢字）', '市区町村名（漢字）']
-            missing_columns = [col for col in required_columns if col not in df.columns]
-            
-            if missing_columns:
-                st.error(f"必要な列が見つかりません: {missing_columns}")
-                st.write("利用可能な列:", df.columns.tolist())
-                return None
-            
-            # データをクリーニング
-            df = df.dropna(subset=['団体コード'])
-            df['団体コード'] = df['団体コード'].astype(str).str.zfill(6)
-            
-            # 市区町村名がNULLの行を除外（都道府県レベルのデータを除外）
-            df = df.dropna(subset=['市区町村名（漢字）'])
-            
-            # 都道府県名と市区町村名を結合して完全な自治体名を作成
-            df['完全自治体名'] = df['都道府県名（漢字）'] + df['市区町村名（漢字）']
-            
-            return df
-            
-        except Exception as e:
-            st.error(f"Excelファイル読み込みエラー: {str(e)}")
-            return None
-    
-    def get_prefectures_from_excel(self, municipal_df):
-        """Excelデータから都道府県一覧を取得"""
-        if municipal_df is None:
-            return []
-        
-        try:
-            prefectures = sorted(municipal_df['都道府県名（漢字）'].dropna().unique())
-            return prefectures
-        except Exception as e:
-            st.error(f"都道府県一覧取得エラー: {str(e)}")
-            return []
-    
-    def get_municipalities_by_prefecture_from_excel(self, municipal_df, prefecture_name):
-        """Excelデータから指定都道府県の自治体一覧を取得"""
-        if municipal_df is None:
-            return []
-        
-        try:
-            filtered_df = municipal_df[municipal_df['都道府県名（漢字）'] == prefecture_name]
-            municipalities = sorted(filtered_df['市区町村名（漢字）'].dropna().unique())
-            return municipalities
-        except Exception as e:
-            st.error(f"自治体一覧取得エラー: {str(e)}")
-            return []
-    
-    def get_municipality_code_from_excel(self, municipal_df, prefecture_name, municipality_name):
-        """Excelデータから自治体コードを取得"""
-        if municipal_df is None:
-            return None
-        
-        try:
-            filtered_df = municipal_df[
-                (municipal_df['都道府県名（漢字）'] == prefecture_name) &
-                (municipal_df['市区町村名（漢字）'] == municipality_name)
-            ]
-            
-            if len(filtered_df) > 0:
-                return filtered_df.iloc[0]['団体コード']
-            else:
-                return None
-        except Exception as e:
-            st.error(f"自治体コード取得エラー: {str(e)}")
-            return None
-    
-    def search_municipality_files(self, folder_url, municipality_code, file_extensions=None):
-        """自治体コードに基づいてファイルを検索"""
-        if file_extensions is None:
-            file_extensions = ['.zip', '.shp']
-        
-        try:
-            # フォルダ内のすべてのファイルを取得
-            all_files = self.get_files_from_web_folder(folder_url, file_extensions)
-            
-            # 自治体コードが含まれるファイルをフィルタリング
-            matching_files = []
-            
-            for file_info in all_files:
-                file_name = file_info['name'].lower()
-                
-                # 自治体コードがファイル名に含まれているかチェック
-                if str(municipality_code) in file_name:
-                    matching_files.append(file_info)
-                    continue
-                
-                # 自治体コードの最初の2桁（都道府県コード）もチェック
-                prefecture_code = str(municipality_code)[:2]
-                if prefecture_code in file_name:
-                    matching_files.append(file_info)
-            
-            return matching_files
-            
-        except Exception as e:
-            st.error(f"ファイル検索エラー: {str(e)}")
-            return []
-    
-    def get_files_from_web_folder(self, folder_url, file_extensions=None):
-        """Web上のフォルダからファイル一覧を取得"""
-        if file_extensions is None:
-            file_extensions = ['.zip', '.shp']
-        
-        try:
-            # キャッシュをチェック
-            cache_key = f"{folder_url}_{','.join(file_extensions)}"
-            if cache_key in st.session_state.web_files_cache:
-                return st.session_state.web_files_cache[cache_key]
-            
-            # GitHubのフォルダの場合
-            if 'github.com' in folder_url:
-                return self._get_github_folder_files(folder_url, file_extensions)
-            
-            # 通常のWebフォルダの場合
-            return self._get_generic_web_folder_files(folder_url, file_extensions)
-            
-        except Exception as e:
-            st.error(f"フォルダからのファイル取得に失敗しました: {str(e)}")
-            return []
-    
-    def _get_github_folder_files(self, folder_url, file_extensions):
-        """GitHubフォルダからファイル一覧を取得（GitHub API使用 + レート制限対策）"""
-        try:
-            # GitHub URLを解析
-            parts = folder_url.replace('https://github.com/', '').split('/')
-            if len(parts) < 2:
-                raise Exception("無効なGitHub URLです")
-            
-            user = parts[0]
-            repo = parts[1]
-            
-            # ブランチとパスを特定
-            if len(parts) > 3 and parts[2] == 'tree':
-                branch = parts[3]
-                path = '/'.join(parts[4:]) if len(parts) > 4 else ''
-            else:
-                branch = 'main'
-                path = '/'.join(parts[2:]) if len(parts) > 2 else ''
-            
-            # まずAPIを試行し、失敗した場合は代替方法を使用
-            try:
-                # GitHub API URL構築
-                api_url = f"https://api.github.com/repos/{user}/{repo}/contents/{path}"
-                if branch != 'main':
-                    api_url += f"?ref={branch}"
-                
-                # GitHub APIトークンがある場合は使用
-                headers = {}
-                github_token = os.environ.get('GITHUB_TOKEN')
-                if github_token:
-                    headers['Authorization'] = f'token {github_token}'
-                
-                response = requests.get(api_url, headers=headers, timeout=30)
-                
-                if response.status_code == 403:
-                    # レート制限の場合、代替方法を使用
-                    st.warning("⚠️ GitHub APIのレート制限に達しました。代替方法でファイルを取得します...")
-                    return self._get_github_files_alternative(user, repo, branch, path, file_extensions)
-                
-                response.raise_for_status()
-                
-                files_data = response.json()
-                files = []
-                
-                for item in files_data:
-                    if item['type'] == 'file':
-                        file_name = item['name']
-                        if any(file_name.lower().endswith(ext.lower()) for ext in file_extensions):
-                            raw_url = item['download_url']
-                            files.append({
-                                'name': file_name,
-                                'url': raw_url,
-                                'size': item.get('size', 0),
-                                'description': f"GitHubファイル ({item.get('size', 0)} bytes)"
-                            })
-                
-                # キャッシュに保存
-                cache_key = f"{folder_url}_{','.join(file_extensions)}"
-                st.session_state.web_files_cache[cache_key] = files
-                
-                return files
-                
-            except requests.exceptions.RequestException as e:
-                if "403" in str(e) or "rate limit" in str(e).lower():
-                    st.warning("⚠️ GitHub APIのレート制限に達しました。代替方法でファイルを取得します...")
-                    return self._get_github_files_alternative(user, repo, branch, path, file_extensions)
-                else:
-                    raise e
-                
-        except Exception as e:
-            raise Exception(f"GitHub処理エラー: {str(e)}")
-    
-    def _get_github_files_alternative(self, user, repo, branch, path, file_extensions):
-        """GitHub APIが使えない場合の代替方法"""
-        try:
-            web_url = f"https://github.com/{user}/{repo}/tree/{branch}/{path}"
-            
-            response = requests.get(web_url, timeout=30)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            files = []
-            
-            # GitHubのファイルリンクを検索
-            file_links = soup.find_all('a', href=True)
-            
-            for link in file_links:
-                href = link.get('href', '')
-                link_text = link.get_text().strip()
-                
-                if '/blob/' in href and any(link_text.lower().endswith(ext.lower()) for ext in file_extensions):
-                    raw_url = f"https://raw.githubusercontent.com{href.replace('/blob/', '/')}"
-                    
-                    files.append({
-                        'name': link_text,
-                        'url': raw_url,
-                        'size': None,
-                        'description': f"GitHubファイル（代替取得）"
-                    })
-            
-            # 重複除去
-            seen_names = set()
-            unique_files = []
-            for file_info in files:
-                if file_info['name'] not in seen_names:
-                    seen_names.add(file_info['name'])
-                    unique_files.append(file_info)
-            
-            return unique_files
-            
-        except Exception as e:
-            raise Exception(f"GitHub代替取得エラー: {str(e)}")
-    
-    def _get_generic_web_folder_files(self, folder_url, file_extensions):
-        """一般的なWebフォルダからファイル一覧を取得"""
-        try:
-            response = requests.get(folder_url, timeout=30)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            files = []
-            
-            links = soup.find_all('a', href=True)
-            
-            for link in links:
-                href = link['href']
-                link_text = link.get_text().strip()
-                
-                if not href.startswith(('http://', 'https://')):
-                    href = urljoin(folder_url, href)
-                
-                if any(href.lower().endswith(ext.lower()) for ext in file_extensions):
-                    file_name = os.path.basename(urlparse(href).path)
-                    if not file_name:
-                        file_name = link_text
-                    
-                    files.append({
-                        'name': file_name,
-                        'url': href,
-                        'size': None,
-                        'description': f"Webファイル"
-                    })
-            
-            return files
-            
-        except Exception as e:
-            raise Exception(f"Webフォルダ処理エラー: {str(e)}")
-    
-    def download_file_from_url(self, url):
-        """URLからファイルをダウンロード"""
-        try:
-            if 'github.com' in url and '/blob/' in url:
-                url = url.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
-            
-            response = requests.get(url, timeout=30)
-            response.raise_for_status()
-            
-            return io.BytesIO(response.content)
-            
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"ファイルのダウンロードに失敗しました: {str(e)}")
-    
-    def load_shapefile_from_url(self, url):
-        """URLからShapefileを読み込み"""
-        try:
-            file_obj = self.download_file_from_url(url)
-            
-            with tempfile.TemporaryDirectory() as temp_dir:
-                try:
-                    with zipfile.ZipFile(file_obj, 'r') as zip_ref:
-                        zip_ref.extractall(temp_dir)
-                    
-                    shp_files = [f for f in os.listdir(temp_dir) if f.endswith('.shp')]
-                    
-                    if shp_files:
-                        shp_path = os.path.join(temp_dir, shp_files[0])
-                        return gpd.read_file(shp_path)
-                    else:
-                        raise Exception("ZIPファイル内にSHPファイルが見つかりません")
-                        
-                except zipfile.BadZipFile:
-                    file_obj.seek(0)
-                    temp_file = os.path.join(temp_dir, "temp_file")
-                    with open(temp_file, 'wb') as f:
-                        f.write(file_obj.read())
-                    
-                    if url.lower().endswith('.shp'):
-                        shp_file = temp_file + '.shp'
-                        os.rename(temp_file, shp_file)
-                        return gpd.read_file(shp_file)
-                    else:
-                        return gpd.read_file(temp_file)
-                        
-        except Exception as e:
-            raise Exception(f"Shapefileの読み込みに失敗しました: {str(e)}")
-    
-    def create_kml_from_geodataframe(self, gdf, name="地番データ"):
-        """GeoPandasデータフレームからKMLファイルを作成"""
-        try:
-            gdf_wgs84 = gdf.to_crs(epsg=4326)
-            
-            kml = ET.Element("kml", xmlns="http://www.opengis.net/kml/2.2")
-            document = ET.SubElement(kml, "Document")
-            doc_name = ET.SubElement(document, "name")
-            doc_name.text = name
-            
-            style = ET.SubElement(document, "Style", id="PolygonStyle")
-            line_style = ET.SubElement(style, "LineStyle")
-            line_color = ET.SubElement(line_style, "color")
-            line_color.text = "ff0000ff"
-            line_width = ET.SubElement(line_style, "width")
-            line_width.text = "2"
-            
-            poly_style = ET.SubElement(style, "PolyStyle")
-            poly_color = ET.SubElement(poly_style, "color")
-            poly_color.text = "3300ff00"
-            
-            for idx, row in gdf_wgs84.iterrows():
-                placemark = ET.SubElement(document, "Placemark")
-                
-                pm_name = ET.SubElement(placemark, "name")
-                if '地番' in row:
-                    pm_name.text = str(row['地番'])
-                else:
-                    pm_name.text = f"地番_{idx}"
-                
-                description = ET.SubElement(placemark, "description")
-                desc_text = ""
-                for col in gdf_wgs84.columns:
-                    if col != 'geometry':
-                        desc_text += f"{col}: {row[col]}<br/>"
-                description.text = desc_text
-                
-                style_url = ET.SubElement(placemark, "styleUrl")
-                style_url.text = "#PolygonStyle"
-                
-                geom = row['geometry']
-                if geom.geom_type == 'Polygon':
-                    self._add_polygon_to_placemark(placemark, geom)
-                elif geom.geom_type == 'MultiPolygon':
-                    for poly in geom.geoms:
-                        self._add_polygon_to_placemark(placemark, poly)
-                elif geom.geom_type == 'Point':
-                    self._add_point_to_placemark(placemark, geom)
-            
-            rough_string = ET.tostring(kml, 'unicode')
-            reparsed = minidom.parseString(rough_string)
-            pretty_xml = reparsed.toprettyxml(indent="  ")
-            
-            return pretty_xml
-            
-        except Exception as e:
-            st.error(f"KML作成エラー: {str(e)}")
-            return None
-    
-    def _add_polygon_to_placemark(self, placemark, polygon):
-        """PolygonをPlacemarkに追加"""
-        multigeometry = placemark.find("MultiGeometry")
-        if multigeometry is None:
-            multigeometry = ET.SubElement(placemark, "MultiGeometry")
-        
-        kml_polygon = ET.SubElement(multigeometry, "Polygon")
-        
-        outer_boundary = ET.SubElement(kml_polygon, "outerBoundaryIs")
-        linear_ring = ET.SubElement(outer_boundary, "LinearRing")
-        coordinates = ET.SubElement(linear_ring, "coordinates")
-        
-        coord_str = ""
-        for x, y in polygon.exterior.coords:
-            coord_str += f"{x},{y},0 "
-        coordinates.text = coord_str.strip()
-        
-        for interior in polygon.interiors:
-            inner_boundary = ET.SubElement(kml_polygon, "innerBoundaryIs")
-            inner_ring = ET.SubElement(inner_boundary, "LinearRing")
-            inner_coordinates = ET.SubElement(inner_ring, "coordinates")
-            
-            inner_coord_str = ""
-            for x, y in interior.coords:
-                inner_coord_str += f"{x},{y},0 "
-            inner_coordinates.text = inner_coord_str.strip()
-    
-    def _add_point_to_placemark(self, placemark, point):
-        """PointをPlacemarkに追加"""
-        kml_point = ET.SubElement(placemark, "Point")
-        coordinates = ET.SubElement(kml_point, "coordinates")
-        coordinates.text = f"{point.x},{point.y},0"
-    
-    def extract_data(self, gdf, oaza, chome, koaza, chiban, range_m):
-        """データ抽出処理"""
-        try:
-            required_columns = ['大字名', '地番']
-            missing_columns = [col for col in required_columns if col not in gdf.columns]
-            
-            if missing_columns:
-                return None, None, f"必要な列が見つかりません: {missing_columns}"
-            
-            search_condition = (
-                (gdf['大字名'] == oaza) & 
-                (gdf['地番'] == chiban) &
-                (gdf['大字名'].notna()) &
-                (gdf['地番'].notna())
-            )
-            
-            if chome is not None and chome != "選択なし" and '丁目名' in gdf.columns:
-                search_condition = search_condition & (gdf['丁目名'] == chome) & (gdf['丁目名'].notna())
-            
-            if koaza is not None and koaza != "選択なし" and '小字名' in gdf.columns:
-                search_condition = search_condition & (gdf['小字名'] == koaza) & (gdf['小字名'].notna())
-            
-            df = gdf[search_condition]
-            
-            if df.empty:
-                return None, None, f"該当する筆が見つかりませんでした"
-            
-            # 中心点計算と周辺筆抽出
-            cen = df.geometry.centroid
-            cen_gdf = gpd.GeoDataFrame(geometry=cen)
-            cen_gdf['x'] = cen_gdf.geometry.x
-            cen_gdf['y'] = cen_gdf.geometry.y
-            
-            i1 = cen_gdf['x'] + range_m
-            i2 = cen_gdf['x'] - range_m
-            i3 = cen_gdf['y'] + range_m
-            i4 = cen_gdf['y'] - range_m
-            
-            x1, y1 = i3.iloc[0], i1.iloc[0]
-            x2, y2 = i4.iloc[0], i2.iloc[0]
-            
-            points = pd.DataFrame([
-                [x1, y1], [x2, y2], [x1, y2], [x2, y1]
-            ], columns=["lon", "lat"])
-            
-            geometry = [Point(xy) for xy in zip(points.lat, points.lon)]
-            four_points_gdf = gpd.GeoDataFrame(points, geometry=geometry)
-            sq = four_points_gdf.dissolve().convex_hull
-            
-            df1 = gpd.GeoDataFrame({'geometry': sq})
-            df1 = df1.set_crs(gdf.crs)
-            
-            valid_data = gdf[(gdf['地番'].notna()) & (gdf['geometry'].notna())].copy()
-            overlay_gdf = df1.overlay(valid_data, how='intersection')
-            
-            return df, overlay_gdf, f"対象筆: {len(df)}件, 周辺筆: {len(overlay_gdf)}件"
-            
-        except Exception as e:
-            return None, None, f"エラー: {str(e)}")
-
-def get_chome_options(gdf, selected_oaza):
-    """指定された大字名に対応する丁目の選択肢を取得"""
-    try:
-        if '丁目名' not in gdf.columns:
-            return None
-        
-        filtered_gdf = gdf[
-            (gdf['大字名'] == selected_oaza) & 
-            (gdf['大字名'].notna()) &
-            (gdf['丁目名'].notna())
-        ]
-        
-        if len(filtered_gdf) == 0:
-            return None
-        
-        chome_list = sorted(filtered_gdf['丁目名'].unique())
-        return chome_list
-        
-    except Exception as e:
-        st.error(f"丁目名取得エラー: {str(e)}")
-        return None
-
-def get_koaza_options(gdf, selected_oaza, selected_chome=None):
-    """指定された大字名（及び丁目名）に対応する小字の選択肢を取得"""
-    try:
-        if '小字名' not in gdf.columns:
-            return None
-        
-        filter_condition = (
-            (gdf['大字名'] == selected_oaza) & 
-            (gdf['大字名'].notna()) &
-            (gdf['小字名'].notna())
-        )
-        
-        if selected_chome and selected_chome != "選択なし" and '丁目名' in gdf.columns:
-            filter_condition = filter_condition & (gdf['丁目名'] == selected_chome) & (gdf['丁目名'].notna())
-        
-        filtered_gdf = gdf[filter_condition]
-        
-        if len(filtered_gdf) == 0:
-            return None
-        
-        koaza_list = sorted(filtered_gdf['小字名'].unique())
-        return koaza_list
-        
-    except Exception as e:
-        st.error(f"小字名取得エラー: {str(e)}")
-        return None
-
-def main():
-    st.title("🗺️ 電子公図データ抽出ツール（Excel自治体データ連携版）")
-    st.markdown("---")
-    
-    extractor = KojiExcelMunicipalExtractor()
-    
-    # Excelファイルから自治体データを読み込み
-    excel_file_path = "000925835.xlsx"  # Excelファイルのパス
-    
-    if st.session_state.municipal_data is None:
-        with st.spinner("自治体データを初期化中..."):
-            st.session_state.municipal_data = extractor.load_municipal_data_from_excel(excel_file_path)
-            
-            if st.session_state.municipal_data is not None:
-                st.success(f"✅ 自治体データを読み込みました（{len(st.session_state.municipal_data)}件）")
-            else:
-                st.error("❌ 自治体データの読み込みに失敗しました")
-    
-    # サイドバー
-    st.sidebar.header("🏛️ 自治体選択")
-    
-    if st.session_state.municipal_data is not None:
-        # 都道府県選択
-        prefectures = extractor.get_prefectures_from_excel(st.session_state.municipal_data)
-        selected_prefecture = st.sidebar.selectbox(
-            "都道府県を選択",
-            ["選択してください"] + prefectures,
-            help="データを取得したい都道府県を選択してください"
-        )
-        
-        # 自治体選択
-        selected_municipality = None
-        municipality_code = None
-        
-        if selected_prefecture and selected_prefecture != "選択してください":
-            municipalities = extractor.get_municipalities_by_prefecture_from_excel(
-                st.session_state.municipal_data, selected_prefecture
-            )
-            
-            if municipalities:
-                selected_municipality = st.sidebar.selectbox(
-                    "自治体を選択",
-                    ["選択してください"] + municipalities,
-                    help="データを取得したい自治体を選択してください"
-                )
-                
-                if selected_municipality and selected_municipality != "選択してください":
-                    municipality_code = extractor.get_municipality_code_from_excel(
-                        st.session_state.municipal_data, selected_prefecture, selected_municipality
-                    )
-                    
-                    if municipality_code:
-                        st.sidebar.success(f"✅ 自治体コード: {municipality_code}")
-                        st.sidebar.info(f"📍 選択: {selected_prefecture} {selected_municipality}")
-                    else:
-                        st.sidebar.error("❌ 自治体コードが見つかりません")
-            else:
-                st.sidebar.warning("該当する自治体が見つかりません")
-    else:
-        st.sidebar.error("❌ 自治体データが読み込まれていません")
-    
-    st.sidebar.markdown("---")
-    
-    # データフォルダ設定
-    st.sidebar.header("📂 データフォルダ設定")
-    
-    # デフォルトのデータフォルダURL
-    default_data_folder = "https://github.com/kentashimoji/koji-data-extractor/tree/main"
-    
-    data_folder_url = st.sidebar.text_input(
-        "データフォルダURL",
-        value=default_data_folder,
-        help="Shapefileが格納されているフォルダのURLを入力してください"
-    )
-    
-    # 自治体コードに基づくファイル検索
-    matching_files = []
-    if municipality_code and data_folder_url:
-        if st.sidebar.button("🔍 該当ファイルを検索", type="primary"):
-            with st.spinner(f"{selected_municipality}のファイルを検索中..."):
-                try:
-                    matching_files = extractor.search_municipality_files(
-                        data_folder_url, 
-                        municipality_code
-                    )
-                    
-                    if matching_files:
-                        st.sidebar.success(f"✅ {len(matching_files)}個のファイルが見つかりました")
-                        st.session_state.matching_files = matching_files
-                        st.session_state.selected_municipality = selected_municipality
-                        st.session_state.municipality_code = municipality_code
-                    else:
-                        st.sidebar.warning(f"❌ {selected_municipality}（コード: {municipality_code}）に該当するファイルが見つかりませんでした")
-                
-                except Exception as e:
-                    st.sidebar.error(f"❌ 検索エラー: {str(e)}")
-    
-    # 検索結果からファイル選択
-    if 'matching_files'
